@@ -120,6 +120,27 @@ async function uploadInputs(event: Event) {
   if (evidenceInput.value) evidenceInput.value.value = ''
 }
 
+// ------------------------------------------------------------ 删除沟通证据
+const deleteEvidenceOpen = ref(false)
+const deleteEvidenceTarget = ref<EvidenceItem | null>(null)
+
+function askDeleteInput(item: EvidenceItem) {
+  deleteEvidenceTarget.value = item
+  deleteEvidenceOpen.value = true
+}
+
+async function confirmDeleteInput() {
+  const target = deleteEvidenceTarget.value
+  if (!target?.id) return
+  await runTask(t('common.loading'), async () => {
+    await draftingApi.deleteInput(projectId.value, target.id!)
+    store.notify(t('common.deleted'), 3000)
+    await reload()
+  })
+  deleteEvidenceOpen.value = false
+  deleteEvidenceTarget.value = null
+}
+
 // ------------------------------------------------------------ 第 1 步：替换标准模板（原型「替换 NTT / SCT / SCC」）
 const templateReplaceInput = ref<HTMLInputElement | null>(null)
 const pendingReplaceKey = ref('')
@@ -1426,6 +1447,16 @@ async function saveVarConfirm(variable: DraftVariable) {
                     </div>
                     <div class="input-meta">{{ pick(item.body) }}</div>
                   </div>
+                  <div class="input-actions">
+                    <button
+                      class="btn icon-only danger"
+                      type="button"
+                      :title="t('common.delete')"
+                      @click="askDeleteInput(item)"
+                    >
+                      <AppIcon name="trash" :size="15" />
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1536,7 +1567,20 @@ async function saveVarConfirm(variable: DraftVariable) {
               <div v-else class="var-field">
                 <label>{{ t('drafting.variables.value') }}</label>
                 <div class="row">
+                  <!-- choice 型 → 下拉选择（是/否 等固定选项） -->
+                  <select
+                    v-if="variable.options.length"
+                    class="doc-var-select"
+                    style="flex: 1"
+                    :value="variable.choice || variable.value"
+                    @change="saveVariable(variable, { choice: ($event.target as HTMLSelectElement).value, confirmed: true })"
+                  >
+                    <option v-for="option in variable.options" :key="option.zhHans" :value="option[currentKey]">
+                      {{ pick(option) }}
+                    </option>
+                  </select>
                   <input
+                    v-else
                     style="flex: 1"
                     :value="variable.value"
                     @change="saveVariable(variable, { value: ($event.target as HTMLInputElement).value, confirmed: true })"
@@ -2027,6 +2071,22 @@ async function saveVarConfirm(variable: DraftVariable) {
         </div>
       </div>
     </div>
+
+    <!-- 删除沟通证据确认 -->
+    <AppModal :open="deleteEvidenceOpen" :title="t('drafting.inputs.deleteTitle')" @close="deleteEvidenceOpen = false">
+      <p>
+        {{
+          t('drafting.inputs.deleteConfirm').replace(
+            '@NAME@',
+            pick(deleteEvidenceTarget?.title) || deleteEvidenceTarget?.fileName || ''
+          )
+        }}
+      </p>
+      <template #footer>
+        <button class="btn" type="button" @click="deleteEvidenceOpen = false">{{ t('common.cancel') }}</button>
+        <button class="btn danger" type="button" @click="confirmDeleteInput">{{ t('common.delete') }}</button>
+      </template>
+    </AppModal>
 
     <!-- 模型识别过程：提示词 + 模型原始返回（含每个变量的依据 sourceQuote 与思路 reason） -->
     <AppModal :open="traceOpen" :title="t('drafting.variables.traceTitle')" wide @close="traceOpen = false">

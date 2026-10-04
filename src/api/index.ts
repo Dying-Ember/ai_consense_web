@@ -55,6 +55,8 @@ export const draftingApi = {
   inputs: (projectId: string) => api.get<EvidenceItem[]>(`/drafting/${projectId}/inputs`),
   uploadInputs: (projectId: string, files: File[]) =>
     api.upload<UploadResult>(`/drafting/${projectId}/inputs/upload`, files),
+  deleteInput: (projectId: string, id: number) =>
+    api.delete<void>(`/drafting/${projectId}/inputs/${id}`),
 
   variables: (projectId: string) => api.get<DraftVariable[]>(`/drafting/${projectId}/variables`),
   extract: (projectId: string) => api.post<DraftVariable[]>(`/drafting/${projectId}/variables/extract`),

@@ -36,7 +36,8 @@ const zhHans = {
     upload: '上传', download: '下载', search: '搜索', refresh: '刷新', delete: '删除', add: '新增',
     reset: '恢复默认', all: '全部', loading: '处理中…', done: '完成', empty: '暂无数据', confirmAll: '确认全部',
     status: '状态', type: '类型', scope: '范围', file: '文件', page: '页码', actions: '操作', detail: '详情',
-    generated: '已生成', pending: '待生成', confirmed: '已确认', unconfirmed: '待确认', saved: '已保存'
+    generated: '已生成', pending: '待生成', confirmed: '已确认', unconfirmed: '待确认', saved: '已保存',
+    deleted: '已删除'
   },
   drafting: {
     title: '按标准模板与项目证据生成 NTT / SCT / SCC',
@@ -50,7 +51,8 @@ const zhHans = {
       blank: '下载空白模板草稿', blankHint: '下载带 {{key}} 占位符的 NTT 模板草稿，可在原 PDF 上加占位符后重新上传',
       blankDownloaded: '空白模板草稿已下载 — 按文件中的 {{key}} 占位符改写 NTT 后重新上传',
     },
-    inputs: { title: '2. 项目沟通证据', desc: '邮件、会议纪要、备忘录与澄清记录，仅用于起草 NTT / SCT / SCC。', upload: '上传起草证据' },
+    inputs: { title: '2. 项目沟通证据', desc: '邮件、会议纪要、备忘录与澄清记录，仅用于起草 NTT / SCT / SCC。', upload: '上传起草证据',
+      deleteTitle: '删除证据', deleteConfirm: '确认删除「@NAME@」？该文件的分块与向量索引将一并移除，操作不可恢复。' },
     variables: {
       baseTitle: '基础变量', fileTitle: '分文件变量', extract: '识别变量', extracting: '本地模型正在识别变量…',
       source: '依据', affects: '影响文件', result: '处理方式', options: '选项', value: '取值', note: '模型依据',
@@ -231,7 +233,8 @@ const zhHant: typeof zhHans = {
     upload: '上傳', download: '下載', search: '搜尋', refresh: '重新整理', delete: '刪除', add: '新增',
     reset: '恢復預設', all: '全部', loading: '處理中…', done: '完成', empty: '暫無資料', confirmAll: '確認全部',
     status: '狀態', type: '類型', scope: '範圍', file: '文件', page: '頁碼', actions: '操作', detail: '詳情',
-    generated: '已生成', pending: '待生成', confirmed: '已確認', unconfirmed: '待確認', saved: '已儲存'
+    generated: '已生成', pending: '待生成', confirmed: '已確認', unconfirmed: '待確認', saved: '已儲存',
+    deleted: '已刪除'
   },
   drafting: {
     title: '按標準模板與項目證據生成 NTT / SCT / SCC',
@@ -245,7 +248,8 @@ const zhHant: typeof zhHans = {
       blank: '下載空白模板草稿', blankHint: '下載帶 {{key}} 佔位符的 NTT 模板草稿，可在原 PDF 上加佔位符後重新上傳',
       blankDownloaded: '空白模板草稿已下載 — 按文件中的 {{key}} 佔位符改寫 NTT 後重新上傳',
     },
-    inputs: { title: '2. 項目溝通證據', desc: '郵件、會議紀要、備忘錄與澄清記錄，僅用於起草 NTT / SCT / SCC。', upload: '上傳起草證據' },
+    inputs: { title: '2. 項目溝通證據', desc: '郵件、會議紀要、備忘錄與澄清記錄，僅用於起草 NTT / SCT / SCC。', upload: '上傳起草證據',
+      deleteTitle: '刪除證據', deleteConfirm: '確認刪除「@NAME@」？該文件的分塊與向量索引將一併移除，操作不可復原。' },
     variables: {
       baseTitle: '基礎變量', fileTitle: '分文件變量', extract: '識別變量', extracting: '本地模型正在識別變量…',
       source: '依據', affects: '影響文件', result: '處理方式', options: '選項', value: '取值', note: '模型依據',
@@ -426,7 +430,8 @@ const en: typeof zhHans = {
     upload: 'Upload', download: 'Download', search: 'Search', refresh: 'Refresh', delete: 'Delete', add: 'Add',
     reset: 'Restore defaults', all: 'All', loading: 'Working…', done: 'Done', empty: 'No data yet', confirmAll: 'Confirm all',
     status: 'Status', type: 'Type', scope: 'Scope', file: 'File', page: 'Page', actions: 'Actions', detail: 'Detail',
-    generated: 'Generated', pending: 'Draft pending', confirmed: 'Confirmed', unconfirmed: 'Pending', saved: 'Saved'
+    generated: 'Generated', pending: 'Draft pending', confirmed: 'Confirmed', unconfirmed: 'Pending', saved: 'Saved',
+    deleted: 'Deleted'
   },
   drafting: {
     title: 'Draft NTT / SCT / SCC from standard templates and project evidence',
@@ -440,7 +445,8 @@ const en: typeof zhHans = {
       blank: 'Download blank template draft', blankHint: 'Download an NTT draft with {{key}} placeholders to edit and re-upload',
       blankDownloaded: 'Blank template draft downloaded — rewrite NTT with the listed {{key}} placeholders and re-upload',
     },
-    inputs: { title: '2. Project communication evidence', desc: 'Email, meeting minutes, memo and clarification records used only to draft NTT / SCT / SCC.', upload: 'Upload drafting evidence' },
+    inputs: { title: '2. Project communication evidence', desc: 'Email, meeting minutes, memo and clarification records used only to draft NTT / SCT / SCC.', upload: 'Upload drafting evidence',
+      deleteTitle: 'Delete evidence', deleteConfirm: 'Delete “@NAME@”? Its parsed chunks and vector index will be removed as well. This cannot be undone.' },
     variables: {
       baseTitle: 'Base variables', fileTitle: 'Per-file variables', extract: 'Discover variables', extracting: 'Local model is discovering variables…',
       source: 'Basis', affects: 'Affects', result: 'How it is handled', options: 'Options', value: 'Value', note: 'Model basis',
