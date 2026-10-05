@@ -311,6 +311,37 @@ let pdfRenderSeq = 0
 let pdfjsLib: any = null
 const PDF_SCALE = 1.35
 
+// ------------------------------------------------------------ DOCX 模板渲染（mammoth → HTML，{{KEY}} 包 hit 徽标复用联动跳转）
+const docxRawHtml = ref('')   // mammoth 转换出的原始 HTML
+const docxHtml = ref('')      // 处理后 HTML（{{KEY}} → <span class="hit" data-hit-var>）
+let docxRenderSeq = 0
+let mammothLib: any = null
+
+/** 模板文件是否为 DOCX/TXT/MD（否则按 PDF 处理） */
+function isDocxTemplate(fileKey: string): boolean {
+  const item = templates.value.find((tm) => tm.key === fileKey)
+  const name = (item?.fileName ?? '').toLowerCase()
+  return name.endsWith('.docx') || name.endsWith('.doc') || name.endsWith('.txt') || name.endsWith('.md')
+}
+
+async function ensureMammoth() {
+  if (mammothLib) return mammothLib
+  // 用 mammoth 自带浏览器打包版（依赖全内联），避免 lib 入口里的 Node 依赖（fs/path）在浏览器失败
+  const mod: any = await import('mammoth/mammoth.browser.min.js')
+  mammothLib = mod.default ?? mod
+  return mammothLib
+}
+
+function releaseDocx() {
+  docxRawHtml.value = ''
+  docxHtml.value = ''
+}
+
+function releaseAllPreview() {
+  releasePdf()
+  releaseDocx()
+}
+
 async function ensurePdfJs() {
   if (pdfjsLib) return pdfjsLib
   const mod: any = await import('pdfjs-dist')
@@ -362,6 +393,143 @@ async function loadPdf() {
     }
   } finally {
     if (seq === pdfRenderSeq) pdfLoading.value = false
+  }
+}
+
+/** 加载 DOCX 模板：后端 /templates/{key}/preview.pdf 原样回传文件字节（docx），mammoth 转 HTML 预览 */
+async function loadDocx() {
+  const requestKey = activeFile.value
+  const seq = ++docxRenderSeq
+  releaseDocx()
+  if (!projectId.value || !draftFileKeys.includes(requestKey)) return
+  pdfLoading.value = true
+  try {
+    const blob = await api.blob(`/drafting/${projectId.value}/templates/${requestKey}/preview.pdf`)
+    if (seq !== docxRenderSeq || activeFile.value !== requestKey) return
+    const lib = await ensureMammoth()
+    const arrayBuffer = await blob.arrayBuffer()
+    const result = await lib.convertToHtml({ arrayBuffer })
+    if (seq !== docxRenderSeq || activeFile.value !== requestKey) return
+    docxRawHtml.value = result.value || ''
+    renderDocxHtml()
+  } catch (err: any) {
+    if (seq === docxRenderSeq) {
+      const biz = err?.response?.data?.message as string | undefined
+      const rawErr = typeof err === 'string' ? err : (err?.stack || err?.message || JSON.stringify(err) || String(err))
+      pdfError.value = biz || rawErr || t('drafting.files.previewFailed')
+      try { console.error('[DOCX] render failed:', err) } catch { /* noop */ }
+    }
+  } finally {
+    if (seq === docxRenderSeq) pdfLoading.value = false
+  }
+}
+
+/** token 纯文本版：与 tokenDisplayHtml 同逻辑，但用于 docx 内联 span（textContent 不能含 HTML） */
+function tokenTextContent(v: DraftVariable | null, key: string, mode: 'review' | 'final'): string {
+  if (!v) return `{{${key}}}`
+  if (v.action === 'delete' || v.action === 'notused') return mode === 'final' ? '' : '×'
+  const r = (v.result || v.choice || v.value || '').trim()
+  if (r && (mode === 'final' || v.confirmed)) return r
+  return `{{${key}}}`
+}
+
+/** DOCX 变量定位词表：模板没有 {{KEY}} 占位符时，按这些英文术语在正文中定位变量影响段。
+ *  只收录强相关的模板术语，避免泛词误标（如 works / bill / system）。 */
+const VAR_LOCATE_TERMS: Record<string, string[]> = {
+  contractTitle: ['contract no.', 'contract title', 'title of contract', 'contract number'],
+  worksType: ['type of works', 'nature of works'],
+  fundingArrangement: ['tender a', 'tender b', 'funding arrangement'],
+  billNos: ['bill of quantities', 'bills of quantities', 'bill no.'],
+  subcontractors: ['sub-contract', 'subcontract', 'nominated sub'],
+  twoEnvelopeSystem: ['two-envelope', 'two envelope'],
+  foundationIncluded: ['foundation works', 'foundation and'],
+  contractPeriod39Months: ['39 month', '39-month', 'period of completion', 'time for completion'],
+}
+
+/** DOCX HTML：把 {{KEY}} 包成 <span class="hit" data-hit-var="KEY">，与 PDF overlay 同结构，locateTokenInEditor 无缝复用。
+ *  模板无占位符时，按 VAR_LOCATE_TERMS 在正文中定位变量影响段，生成弱锚点 hit-loose（只定位、不改写文本）。 */
+function renderDocxHtml() {
+  const raw = docxRawHtml.value
+  if (!raw) {
+    docxHtml.value = ''
+    return
+  }
+  const byKey = new Map(variables.value.map((v) => [v.key, v] as const))
+  // 每个 key 的定位词（预置术语 + key 驼峰拆分短语）
+  const locateTerms = new Map<string, string[]>()
+  for (const v of variables.value) {
+    const terms: string[] = []
+    const preset = VAR_LOCATE_TERMS[v.key]
+    if (preset) terms.push(...preset)
+    const camelSplit = v.key.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().trim()
+    if (camelSplit.length > 3 && !terms.includes(camelSplit)) terms.push(camelSplit)
+    if (terms.length) locateTerms.set(v.key, terms)
+  }
+  const doc = new DOMParser().parseFromString(raw, 'text/html')
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT)
+  const textNodes: Text[] = []
+  while (walker.nextNode()) textNodes.push(walker.currentNode as Text)
+  const tokenRe = /\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g
+  for (const node of textNodes) {
+    const text = node.nodeValue ?? ''
+    const frag = doc.createDocumentFragment()
+    let cursor = 0
+    let changed = false
+    // 1) {{KEY}} 精确占位符
+    tokenRe.lastIndex = 0
+    let m: RegExpExecArray | null
+    while ((m = tokenRe.exec(text)) !== null) {
+      if (m.index > cursor) frag.appendChild(doc.createTextNode(text.slice(cursor, m.index)))
+      const key = m[1]
+      const v = byKey.get(key) ?? null
+      const span = doc.createElement('span')
+      span.className = 'hit ' + tokenCssClass(v)
+      span.setAttribute('data-hit-var', key)
+      span.textContent = tokenTextContent(v, key, previewMode.value)
+      frag.appendChild(span)
+      cursor = m.index + m[0].length
+      changed = true
+    }
+    // 2) 无 {{KEY}} 时：术语定位锚点（弱样式，每节点最多命中一个 key，避免过度标注）
+    if (!changed && locateTerms.size) {
+      const lower = text.toLowerCase()
+      for (const [key, terms] of locateTerms) {
+        let placed = false
+        for (const term of terms) {
+          const rawIdx = lower.indexOf(term.toLowerCase())
+          if (rawIdx < 0 || rawIdx < cursor) continue
+          // 边界词界检查，避免子串误标（如 foundation 命中 foundationless）
+          const before = rawIdx === 0 ? '' : lower[rawIdx - 1]
+          const afterChar = lower[rawIdx + term.length] ?? ''
+          if (before && /[a-z0-9]/.test(before)) continue
+          if (afterChar && /[a-z0-9]/.test(afterChar)) continue
+          if (rawIdx > cursor) frag.appendChild(doc.createTextNode(text.slice(cursor, rawIdx)))
+          const span = doc.createElement('span')
+          span.className = 'hit hit-loose'
+          span.setAttribute('data-hit-var', key)
+          span.textContent = text.slice(rawIdx, rawIdx + term.length)
+          frag.appendChild(span)
+          cursor = rawIdx + term.length
+          changed = true
+          placed = true
+          break
+        }
+        if (placed) break
+      }
+    }
+    if (changed && cursor < text.length) frag.appendChild(doc.createTextNode(text.slice(cursor)))
+    if (changed) node.parentNode?.replaceChild(frag, node)
+  }
+  docxHtml.value = doc.body.innerHTML
+}
+
+/** 统一入口：按模板类型分流（docx → mammoth HTML；pdf → PDF.js canvas） */
+function loadPreview() {
+  releaseAllPreview()
+  if (isDocxTemplate(activeFile.value)) {
+    void loadDocx()
+  } else {
+    void loadPdf()
   }
 }
 
@@ -758,19 +926,22 @@ function regenerateHtml() {
     })
 }
 
-/** 监听变量和 previewMode 变化 → 重新生成 html（响应式） */
-watch([variables, previewMode], () => regenerateHtml(), { deep: true })
+/** 监听变量和 previewMode 变化 → 重新生成 html（响应式；PDF overlay 与 DOCX 徽标各自重算） */
+watch([variables, previewMode], () => {
+  regenerateHtml()
+  renderDocxHtml()
+}, { deep: true })
 
 watch(
-  [activeFile, projectId],
+  [activeFile, projectId, templates],
   () => {
-    loadPdf()
+    loadPreview()
   },
   { immediate: true }
 )
 // 变量列表 / previewMode 变化已在 regenerateHtml() 的 watch 里统一处理
 
-onBeforeUnmount(releasePdf)
+onBeforeUnmount(releaseAllPreview)
 
 /** 审阅调整点：默认列出当前文件未确认的变量；全部确认后回退为列表，便于回归检查 */
 const reviewableVars = computed(() => {
@@ -1263,8 +1434,12 @@ function truncateSvg(text: string, max = 22): string {
   return text.length > max ? text.slice(0, max - 1) + '…' : text
 }
 
-/** PDF 中识别出的 {{KEY}} 数量 / 命中变量数 / 当前文件变量数（用于头部诊断条） */
+/** PDF/DOCX 中识别出的 {{KEY}} 数量 / 命中变量数 / 当前文件变量数（用于头部诊断条） */
 const pdfTokenCount = computed(() => {
+  if (docxHtml.value) {
+    const matches = docxHtml.value.match(/data-hit-var="[^"]+"/g)
+    return matches ? matches.length : 0
+  }
   let n = 0
   for (const p of pdfPages.value) {
     // 用正则统计 .hit[data-hit-var] 节点
@@ -1275,6 +1450,15 @@ const pdfTokenCount = computed(() => {
 })
 const pdfMatchedCount = computed(() => {
   const keys = new Set(variables.value.map((v) => v.key))
+  if (docxHtml.value) {
+    const matches = docxHtml.value.match(/data-hit-var="([^"]+)"/g) ?? []
+    let n = 0
+    for (const m of matches) {
+      const k = m.match(/data-hit-var="([^"]+)"/)![1]
+      if (keys.has(k)) n++
+    }
+    return n
+  }
   let n = 0
   for (const p of pdfPages.value) {
     const matches = p.html.match(/data-hit-var="([^"]+)"/g) ?? []
@@ -1986,9 +2170,14 @@ async function saveVarConfirm(variable: DraftVariable) {
                   <!-- PDF 铺满右栏：PDF.js canvas 多页 + overlay 替换变量；doc 与 preview 视图完全一致 -->
                   <div class="de-body">
                     <div class="de-preview-full">
-                      <div v-if="pdfLoading" class="dt-loading">{{ t('common.loading') }}</div>
+                      <!-- DOCX 模板：mammoth HTML 流式预览，{{KEY}} 徽标与 PDF 同构，点击变量联动滚动 -->
+                      <div v-if="docxHtml" class="pdf-scroll docx-scroll" ref="pdfScrollContainer">
+                        <div class="docx-page" v-html="docxHtml" @click="onPdfOverlayClick"></div>
+                      </div>
+                      <div v-else-if="pdfLoading" class="dt-loading">{{ t('common.loading') }}</div>
                       <div v-else-if="pdfError" class="dt-loading">{{ pdfError }}</div>
                       <div v-else-if="!pdfPages.length" class="dt-loading">{{ t('drafting.files.previewFailed') }}</div>
+                      <!-- PDF 模板：PDF.js canvas 多页 + overlay 替换变量 -->
                       <div v-else class="pdf-scroll" ref="pdfScrollContainer">
                         <div
                           v-for="(page, idx) in pdfPages"
@@ -2511,6 +2700,64 @@ async function saveVarConfirm(variable: DraftVariable) {
   gap: 18px;
   background: #eef0f3;
 }
+/* ---------- DOCX 模板预览（mammoth HTML 流式布局） ---------- */
+.docx-scroll {
+  display: block;
+  padding: 24px;
+  gap: 0;
+}
+.docx-page {
+  background: #fff;
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 28px 44px 48px;
+  box-shadow: 0 1px 8px rgba(0, 0, 0, 0.12);
+  border-radius: 4px;
+  font-size: 14px;
+  line-height: 1.75;
+  color: #1f2937;
+  word-break: break-word;
+}
+.docx-page h1, .docx-page h2, .docx-page h3, .docx-page h4 {
+  margin: 20px 0 8px;
+  line-height: 1.35;
+  font-weight: 600;
+  color: #111827;
+}
+.docx-page p { margin: 8px 0; }
+.docx-page table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+.docx-page th, .docx-page td { border: 1px solid #d1d5db; padding: 6px 10px; text-align: left; vertical-align: top; }
+.docx-page th { background: #f3f4f6; font-weight: 600; }
+.docx-page ul, .docx-page ol { margin: 8px 0; padding-left: 24px; }
+.docx-page li { margin: 3px 0; }
+.docx-page img { max-width: 100%; }
+/* docx 内联徽标：覆盖 PDF overlay 的绝对定位，改成流式 inline 徽标，联动高亮类复用 */
+.docx-page .hit {
+  position: static;
+  display: inline-block;
+  border-radius: 3px;
+  padding: 0 3px;
+  margin: 0 1px;
+  font-size: inherit;
+  line-height: 1.25;
+}
+.docx-page .hit.tok-ok { background: rgba(22, 163, 74, 0.14); border: 1px solid rgba(22, 163, 74, 0.5); color: #065f46; }
+.docx-page .hit.tok-ok-empty { background: rgba(148, 163, 184, 0.16); border: 1px dashed #94a3b8; color: #475569; }
+.docx-page .hit.tok-warn { background: rgba(245, 158, 11, 0.16); border: 1px solid rgba(245, 158, 11, 0.55); color: #92400e; }
+.docx-page .hit.tok-unknown { background: rgba(239, 68, 68, 0.10); border: 1px dashed #f87171; color: #991b1b; }
+.docx-page .hit.tok-deleted { background: #fff; border: 1px solid #e5e7eb; color: #9ca3af; }
+/* 弱锚点：模板无 {{KEY}} 占位符时按术语定位，只作跳转标记，不改写文本 */
+.docx-page .hit.hit-loose {
+  background: rgba(37, 99, 235, 0.10);
+  border: 1px dashed rgba(37, 99, 235, 0.5);
+  color: inherit;
+  cursor: pointer;
+  border-radius: 2px;
+  padding: 0 2px;
+}
+.docx-page.final .hit.tok-unknown { display: none; }
+.docx-page.final .hit.tok-deleted { background: #fff; color: transparent; border-color: transparent; }
+.docx-page .hit::before { display: none; }
 .pdf-page-wrap {
   position: relative;
   background: #fff;
