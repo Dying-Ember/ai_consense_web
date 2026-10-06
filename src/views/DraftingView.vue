@@ -2207,7 +2207,7 @@ async function saveVarConfirm(variable: DraftVariable) {
               </div>
             </div>
 
-            <!-- 右栏：标准模板 PDF（铺满整个右栏，doc/preview 双视图统一） + 审阅调整点抽屉 -->
+            <!-- 右栏：标准模板预览（docx 经 mammoth 渲染 / PDF 走 PDF.js canvas）+ 审阅调整点抽屉 -->
             <div class="doc-pane">
               <div class="doc-pane-head">
                 <strong>{{ activeFile }} · {{ t('drafting.files.headerTitle') }}</strong>
