@@ -339,6 +339,7 @@ async function ensureMammoth() {
 function releaseDocx() {
   docxRawHtml.value = ''
   docxHtml.value = ''
+  pdfError.value = ''
 }
 
 function releaseAllPreview() {
@@ -416,6 +417,7 @@ async function loadDocx() {
     if (seq !== docxRenderSeq || activeFile.value !== requestKey) return
     docxRawHtml.value = result.value || ''
     renderDocxHtml()
+    if (seq === docxRenderSeq) pdfError.value = ''
   } catch (err: any) {
     if (seq === docxRenderSeq) {
       const biz = err?.response?.data?.message as string | undefined
@@ -2265,28 +2267,6 @@ async function saveVarConfirm(variable: DraftVariable) {
                       <div v-if="docxHtml" class="pdf-scroll docx-scroll" ref="pdfScrollContainer">
                         <div class="docx-page" v-html="docxHtml" @click="onPdfOverlayClick"></div>
                       </div>
-                      <!-- 就地取值浮层：点击预览内值徽标后出现，选择后直接保存到变量并回写文件 -->
-                      <div
-                        v-if="valueEdit && valueEditPos"
-                        class="value-edit-pop"
-                        :style="{ top: valueEditPos.top + 'px', left: valueEditPos.left + 'px' }"
-                        @click.stop
-                      >
-                        <div class="value-edit-head">
-                          <strong>{{ valueEditVar ? pick(valueEditVar.label) : valueEdit.key }}</strong>
-                          <span v-if="valueEditVar" class="act-badge" :class="valueEditVar ? actionTag(valueEditVar.action).cls : ''">
-                            {{ valueEditVar ? actionTag(valueEditVar.action).label : '' }}
-                          </span>
-                        </div>
-                        <select v-if="valueEditVar && valueEditVar.options.length" v-model="valueEditVal" class="value-edit-select">
-                          <option v-for="o in valueEditVar.options" :key="pick(o)" :value="pick(o)">{{ pick(o) }}</option>
-                        </select>
-                        <input v-else v-model="valueEditVal" class="value-edit-input" placeholder="输入取值…" />
-                        <div class="value-edit-actions">
-                          <button class="btn soft" type="button" @click="valueEdit = null">{{ t('common.cancel') }}</button>
-                          <button class="btn" type="button" @click="saveValueEdit">{{ t('common.save') }}</button>
-                        </div>
-                      </div>
                       <div v-else-if="pdfLoading" class="dt-loading">{{ t('common.loading') }}</div>
                       <div v-else-if="pdfError" class="dt-loading">{{ pdfError }}</div>
                       <div v-else-if="!pdfPages.length" class="dt-loading">{{ t('drafting.files.previewFailed') }}</div>
@@ -2316,6 +2296,28 @@ async function saveVarConfirm(variable: DraftVariable) {
                             @click="onPdfOverlayClick"
                             v-html="page.html"
                           ></div>
+                        </div>
+                      </div>
+                      <!-- 就地取值浮层：点击预览内值徽标后出现，选择后直接保存到变量并回写文件（独立于上方 v-if 链） -->
+                      <div
+                        v-if="valueEdit && valueEditPos"
+                        class="value-edit-pop"
+                        :style="{ top: valueEditPos.top + 'px', left: valueEditPos.left + 'px' }"
+                        @click.stop
+                      >
+                        <div class="value-edit-head">
+                          <strong>{{ valueEditVar ? pick(valueEditVar.label) : valueEdit.key }}</strong>
+                          <span v-if="valueEditVar" class="act-badge" :class="valueEditVar ? actionTag(valueEditVar.action).cls : ''">
+                            {{ valueEditVar ? actionTag(valueEditVar.action).label : '' }}
+                          </span>
+                        </div>
+                        <select v-if="valueEditVar && valueEditVar.options.length" v-model="valueEditVal" class="value-edit-select">
+                          <option v-for="o in valueEditVar.options" :key="pick(o)" :value="pick(o)">{{ pick(o) }}</option>
+                        </select>
+                        <input v-else v-model="valueEditVal" class="value-edit-input" placeholder="输入取值…" />
+                        <div class="value-edit-actions">
+                          <button class="btn soft" type="button" @click="valueEdit = null">{{ t('common.cancel') }}</button>
+                          <button class="btn" type="button" @click="saveValueEdit">{{ t('common.save') }}</button>
                         </div>
                       </div>
                     </div>
