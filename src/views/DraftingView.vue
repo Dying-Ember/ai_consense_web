@@ -514,6 +514,16 @@ function renderDocxHtml() {
           span.textContent = text.slice(rawIdx, rawIdx + term.length)
           frag.appendChild(span)
           cursor = rawIdx + term.length
+          // 值徽标：choice/fill 变量的就地取值入口（不破坏模板原文）；list 变量跳过，避免破坏清单 JSON
+          const v = byKey.get(key)
+          if (v && v.kind !== 'list' && (v.options.length > 0 || v.action === 'fill')) {
+            const badge = doc.createElement('span')
+            badge.className = 'hit-value-badge'
+            badge.setAttribute('data-hit-key', key)
+            const cur = (v.result || v.choice || v.value || '').trim()
+            badge.textContent = cur || '待选'
+            frag.appendChild(badge)
+          }
           changed = true
           placed = true
           break
@@ -984,7 +994,7 @@ async function locateTokenInEditor(variableKey: string, opts?: { cycle?: boolean
   const container = pdfScrollContainer.value
   if (!container) {
     console.warn('[locate] pdfScrollContainer 为空，PDF 还没渲染?')
-    store.notify(t('drafting.files.noLocatePoint').replaceAll('@KEY@', variableKey), 4200)
+    store.notify(t('drafting.files.noLocatePoint').replace(/@KEY@/g, variableKey), 4200)
     return
   }
 
@@ -1010,7 +1020,7 @@ async function locateTokenInEditor(variableKey: string, opts?: { cycle?: boolean
   if (!els.length) {
     console.warn(`[locate] key=${variableKey} 等了 ${waitedMs}ms 仍未在 PDF 中找到节点。` +
       `pdfPages=${pdfPages.value.length} 页，pending=${pdfPages.value.filter(p => p.ocrStatus === 'pending').length} 页，ocrStatus=${ocrProgress.value.status}`)
-    store.notify(t('drafting.files.noLocatePoint').replaceAll('@KEY@', variableKey), 4200)
+    store.notify(t('drafting.files.noLocatePoint').replace(/@KEY@/g, variableKey), 4200)
     return
   }
 
@@ -1037,12 +1047,60 @@ async function locateTokenInEditor(variableKey: string, opts?: { cycle?: boolean
   els[idx].scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
-/** PDF 容器反向联动：点 overlay token → 联动左栏 */
+/** PDF 容器反向联动：点 overlay token → 联动左栏；点值徽标 → 打开就地取值浮层 */
 function onPdfOverlayClick(e: MouseEvent) {
+  const badge = (e.target as HTMLElement | null)?.closest('.hit-value-badge')
+  if (badge) {
+    const bk = badge.getAttribute('data-hit-key')
+    if (bk) {
+      openValueEdit(e, bk)
+      return
+    }
+  }
   const hit = (e.target as HTMLElement | null)?.closest('[data-hit-var]')
   if (!hit) return
   const key = hit.getAttribute('data-hit-var')
   if (key) void locateTokenInEditor(key, { cycle: true })
+}
+
+// ------------------------------------------------------------ 值徽标 · 就地取值浮层（docx 预览内直接改变量值）
+const valueEdit = ref<{ key: string } | null>(null)
+const valueEditVal = ref('')
+const valueEditPos = ref<{ top: number; left: number } | null>(null)
+const valueEditVar = computed(() =>
+  valueEdit.value ? variables.value.find((v) => v.key === valueEdit.value?.key) ?? null : null
+)
+
+function openValueEdit(e: MouseEvent, key: string) {
+  const v = variables.value.find((x) => x.key === key)
+  if (!v) return
+  valueEditVal.value = (v.result || v.choice || v.value || '').trim()
+  const rect = (e.target as HTMLElement).getBoundingClientRect()
+  valueEditPos.value = {
+    top: rect.bottom + 6,
+    left: Math.max(8, Math.min(rect.left, window.innerWidth - 280)),
+  }
+  valueEdit.value = { key }
+}
+
+async function saveValueEdit() {
+  const ed = valueEdit.value
+  if (!ed) return
+  const v = variables.value.find((x) => x.key === ed.key)
+  if (!v) return
+  const val = valueEditVal.value.trim()
+  if (!val) {
+    valueEdit.value = null
+    return
+  }
+  try {
+    if (v.options.length > 0) await saveVariable(v, { choice: val, confirmed: true })
+    else await saveVariable(v, { value: val, confirmed: true })
+  } catch {
+    /* saveVariable 内部已 toast 错误 */
+  } finally {
+    valueEdit.value = null
+  }
 }
 
 /** CSS.escape polyfill（保证变量 key 中的特殊字符在 querySelector 中安全） */
@@ -2207,6 +2265,28 @@ async function saveVarConfirm(variable: DraftVariable) {
                       <div v-if="docxHtml" class="pdf-scroll docx-scroll" ref="pdfScrollContainer">
                         <div class="docx-page" v-html="docxHtml" @click="onPdfOverlayClick"></div>
                       </div>
+                      <!-- 就地取值浮层：点击预览内值徽标后出现，选择后直接保存到变量并回写文件 -->
+                      <div
+                        v-if="valueEdit && valueEditPos"
+                        class="value-edit-pop"
+                        :style="{ top: valueEditPos.top + 'px', left: valueEditPos.left + 'px' }"
+                        @click.stop
+                      >
+                        <div class="value-edit-head">
+                          <strong>{{ valueEditVar ? pick(valueEditVar.label) : valueEdit.key }}</strong>
+                          <span v-if="valueEditVar" class="act-badge" :class="valueEditVar ? actionTag(valueEditVar.action).cls : ''">
+                            {{ valueEditVar ? actionTag(valueEditVar.action).label : '' }}
+                          </span>
+                        </div>
+                        <select v-if="valueEditVar && valueEditVar.options.length" v-model="valueEditVal" class="value-edit-select">
+                          <option v-for="o in valueEditVar.options" :key="pick(o)" :value="pick(o)">{{ pick(o) }}</option>
+                        </select>
+                        <input v-else v-model="valueEditVal" class="value-edit-input" placeholder="输入取值…" />
+                        <div class="value-edit-actions">
+                          <button class="btn soft" type="button" @click="valueEdit = null">{{ t('common.cancel') }}</button>
+                          <button class="btn" type="button" @click="saveValueEdit">{{ t('common.save') }}</button>
+                        </div>
+                      </div>
                       <div v-else-if="pdfLoading" class="dt-loading">{{ t('common.loading') }}</div>
                       <div v-else-if="pdfError" class="dt-loading">{{ pdfError }}</div>
                       <div v-else-if="!pdfPages.length" class="dt-loading">{{ t('drafting.files.previewFailed') }}</div>
@@ -2801,6 +2881,58 @@ async function saveVarConfirm(variable: DraftVariable) {
 .docx-page .hit.tok-warn { background: rgba(245, 158, 11, 0.16); border: 1px solid rgba(245, 158, 11, 0.55); color: #92400e; }
 .docx-page .hit.tok-unknown { background: rgba(239, 68, 68, 0.10); border: 1px dashed #f87171; color: #991b1b; }
 .docx-page .hit.tok-deleted { background: #fff; border: 1px solid #e5e7eb; color: #9ca3af; }
+/* 值徽标：模板无占位符时锚点旁的取值入口 */
+.hit-value-badge {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: #1d4ed8;
+  background: #dbeafe;
+  border: 1px solid #bfdbfe;
+  border-radius: 4px;
+  padding: 1px 8px;
+  cursor: pointer;
+  user-select: none;
+  vertical-align: baseline;
+}
+.hit-value-badge:hover {
+  background: #bfdbfe;
+}
+/* 就地取值浮层 */
+.value-edit-pop {
+  position: fixed;
+  z-index: 1200;
+  width: 260px;
+  background: #fff;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  box-shadow: 0 8px 30px rgba(15, 23, 42, 0.18);
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+}
+.value-edit-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.value-edit-head strong { font-size: 13.5px; }
+.value-edit-select,
+.value-edit-input {
+  width: 100%;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  background: #fff;
+}
+.value-edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
 /* 弱锚点：模板无 {{KEY}} 占位符时按术语定位，只作跳转标记，不改写文本 */
 .docx-page .hit.hit-loose {
   background: rgba(37, 99, 235, 0.10);
