@@ -42,6 +42,10 @@ const baseVariables = computed(() => variables.value.filter((item) => item.scope
 const fileVariables = computed(() =>
   variables.value.filter((item) => item.scope === 'FILE' && (!item.fileKey || item.fileKey === activeFile.value))
 )
+/** 影响当前文件的 BASE 变量：在第 3 步左栏作为定位入口（只读，不参与确认计数） */
+const fileBaseVars = computed(() =>
+  baseVariables.value.filter((v) => !v.affects.length || v.affects.includes(activeFile.value))
+)
 const draftFileKeys = ['NTT', 'SCT', 'SCC']
 const activeDocument = computed(() => documents.value.find((doc) => doc.fileKey === activeFile.value) ?? null)
 
@@ -980,6 +984,7 @@ async function locateTokenInEditor(variableKey: string, opts?: { cycle?: boolean
   const container = pdfScrollContainer.value
   if (!container) {
     console.warn('[locate] pdfScrollContainer 为空，PDF 还没渲染?')
+    store.notify(t('drafting.files.noLocatePoint').replaceAll('@KEY@', variableKey), 4200)
     return
   }
 
@@ -1005,6 +1010,7 @@ async function locateTokenInEditor(variableKey: string, opts?: { cycle?: boolean
   if (!els.length) {
     console.warn(`[locate] key=${variableKey} 等了 ${waitedMs}ms 仍未在 PDF 中找到节点。` +
       `pdfPages=${pdfPages.value.length} 页，pending=${pdfPages.value.filter(p => p.ocrStatus === 'pending').length} 页，ocrStatus=${ocrProgress.value.status}`)
+    store.notify(t('drafting.files.noLocatePoint').replaceAll('@KEY@', variableKey), 4200)
     return
   }
 
@@ -1682,7 +1688,11 @@ async function saveVarConfirm(variable: DraftVariable) {
           <div v-else class="base-var-list">
             <div v-for="variable in baseVariables" :key="variable.key" class="var-card">
               <div class="var-card-head">
-                <div class="title">
+                <div
+                  class="title var-locate-title"
+                  :title="t('drafting.files.locateHint')"
+                  @click="locateTokenInEditor(variable.key)"
+                >
                   <strong><span class="key">{{ variable.key }}</span>{{ pick(variable.label) }}</strong>
                 </div>
                 <div class="tags">
@@ -2015,6 +2025,29 @@ async function saveVarConfirm(variable: DraftVariable) {
                 </div>
               </div>
               <div class="var-scroll">
+                <!-- 影响当前文件的基础变量（第 2 步已确认，这里作为定位入口，只读） -->
+                <template v-for="variable in fileBaseVars" :key="'base-' + variable.key">
+                  <div
+                    :data-key="variable.key"
+                    class="doc-var-card doc-var-card--base"
+                    :class="{ selected: selectedDocVarKey === variable.key, flash: flashTokenKey === variable.key }"
+                    @click="selectDocVar(variable.key)"
+                  >
+                    <div class="doc-var-title">
+                      <div class="doc-var-title-main">
+                        <span class="base-badge">基础</span>
+                        <strong>{{ pick(variable.label) }}</strong>
+                        <span class="act-badge" :class="actionTag(variable.action).cls">
+                          {{ actionTag(variable.action).label }}
+                        </span>
+                      </div>
+                    </div>
+                    <div class="doc-var-line">
+                      <b>{{ t('drafting.files.impactPoint') }}</b>
+                      <span class="rp-anchor">{{ variable.source || t('drafting.files.noAnchor') }}</span>
+                    </div>
+                  </div>
+                </template>
                 <div
                   v-for="variable in fileVariables"
                   :key="variable.key"
@@ -2504,6 +2537,28 @@ async function saveVarConfirm(variable: DraftVariable) {
 .doc-var-card.confirmed {
   border-color: #9fe1cb;
   background: #f4fbf8;
+}
+/* 基础变量定位入口卡（第 3 步左栏，只读） */
+.doc-var-card--base {
+  border-color: #dbeafe;
+  background: #f8faff;
+  padding: 10px 14px;
+  gap: 6px;
+}
+.doc-var-card--base .doc-var-title strong {
+  font-size: 13.5px;
+}
+.doc-var-card--base .doc-var-line {
+  font-size: 12px;
+}
+.base-badge {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: #1d4ed8;
+  background: #dbeafe;
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-right: 2px;
 }
 .doc-var-card.selected {
   outline: 2px solid var(--primary, #2563eb);
