@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { projectApi, setApiErrorReporter, skillApi, systemApi } from '@/api'
-import type { Project, SkillDoc, SystemHealth } from '@/api/types'
+import { captureLlmSelection, projectApi, setApiErrorReporter, setLlmProfileResolver, skillApi, systemApi } from '@/api'
+import type { LlmProfileId, LlmProfiles, Project, SkillDoc, SystemHealth } from '@/api/types'
 import { currentLocale, setLocale, type AppLocale } from '@/i18n'
 
 export interface ToastState {
@@ -9,10 +9,24 @@ export interface ToastState {
   visible: boolean
 }
 
+const LLM_PROFILE_STORAGE = 'consense-llm-profile'
+function storedLlmProfile(): LlmProfileId | null {
+  try {
+    const stored = localStorage.getItem(LLM_PROFILE_STORAGE)
+    return stored === 'local' || stored === 'minimax-cn' ? stored : null
+  } catch { return null }
+}
+
 export const useAppStore = defineStore('app', () => {
   const projects = ref<Project[]>([])
   const activeProjectId = ref<string>('')
   const health = ref<SystemHealth | null>(null)
+  const llmProfiles = ref<LlmProfiles | null>(null)
+  const llmProfileId = ref<LlmProfileId | null>(storedLlmProfile())
+  const llmProfilesLoading = ref(false)
+  const llmProfilesFailed = ref(false)
+  const selectedLlmProfile = computed(() => llmProfiles.value?.profiles.find(profile => profile.id === llmProfileId.value) ?? null)
+  setLlmProfileResolver(() => llmProfileId.value)
   const skills = ref<SkillDoc[]>([])
   const bootstrapped = ref(false)
   const busyMessage = ref('')
@@ -115,11 +129,30 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
+  async function loadLlmProfiles() {
+    llmProfilesLoading.value = true
+    llmProfilesFailed.value = false
+    try {
+      llmProfiles.value = await systemApi.llmProfiles()
+      if (!llmProfiles.value.profiles.some(profile => profile.id === llmProfileId.value)) llmProfileId.value = llmProfiles.value.defaultProfile
+    } catch {
+      llmProfilesFailed.value = true
+    } finally {
+      llmProfilesLoading.value = false
+    }
+  }
+
+  function changeLlmProfile(id: string) {
+    if (!llmProfiles.value?.profiles.some(profile => profile.id === id && profile.configured)) return
+    llmProfileId.value = id as LlmProfileId
+    try { localStorage.setItem(LLM_PROFILE_STORAGE, id) } catch { /* Keep this session's explicit choice when browser storage is unavailable. */ }
+  }
+
   async function bootstrap() {
     if (bootstrapped.value) return
     setApiErrorReporter((message) => notify(message, 5000))
     try {
-      await Promise.all([loadProjects(), loadHealth()])
+      await Promise.all([loadProjects(), loadHealth(), loadLlmProfiles()])
       loadSkills().catch(() => undefined)
       bootstrapped.value = true
     } catch {
@@ -132,6 +165,14 @@ export const useAppStore = defineStore('app', () => {
     activeProjectId,
     activeProject,
     health,
+    llmProfiles,
+    llmProfileId,
+    selectedLlmProfile,
+    llmProfilesLoading,
+    llmProfilesFailed,
+    loadLlmProfiles,
+    changeLlmProfile,
+    captureLlmSelection,
     skills,
     busyMessage,
     toast,

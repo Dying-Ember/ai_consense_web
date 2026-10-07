@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import { useRoute, useRouter } from 'vue-router'
 import { useAppStore } from '@/stores/app'
 import AppIcon from './AppIcon.vue'
+import { inspectionWords } from '@/i18n/inspection'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -15,6 +16,7 @@ const navCollapsed = defineModel<boolean>('collapsed', { default: false })
 const NAV_ITEMS = computed(() => [
   { name: 'drafting', label: t('nav.drafting'), icon: 'drafting' },
   { name: 'vetting', label: t('nav.vetting'), icon: 'vetting' },
+  { name: 'vetting-inspection', label: inspectionWords(store.locale).title, icon: 'layers' },
   { name: 'advice', label: t('nav.advice'), icon: 'advice' }
 ])
 
