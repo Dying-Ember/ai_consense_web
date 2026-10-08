@@ -17,11 +17,11 @@ export default defineConfig({
     allowedHosts: true,
     proxy: {
       '/api': {
-        target: 'http://localhost:8080',
+        target: process.env.CONSENSE_API_TARGET || 'http://localhost:8080',
         changeOrigin: true,
-        // 审查 / 变量抽取会调用本地大模型，超时放宽到 10 分钟
-        timeout: 600000,
-        proxyTimeout: 600000
+        // 整包起草会逐段处理完整 SCC；各 API 的客户端超时仍分别限制。
+        timeout: 3600000,
+        proxyTimeout: 3600000
       }
     }
   },
