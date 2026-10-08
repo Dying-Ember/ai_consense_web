@@ -67,6 +67,7 @@ async function scrollToBottom() {
 async function ask(text?: string) {
   const content = (text ?? question.value).trim()
   if (!content || asking.value) return
+  const llmSelection = store.captureLlmSelection()
   asking.value = true
   question.value = ''
   messages.value.push({
@@ -82,10 +83,12 @@ async function ask(text?: string) {
   await scrollToBottom()
 
   try {
-    const response = await adviceApi.ask(projectId.value, content, scope.value)
+    const response = await adviceApi.ask(projectId.value, content, scope.value, llmSelection)
     messages.value.push({
       id: null,
       role: 'assistant',
+      modelIdentity: response.modelIdentity,
+      model: response.model,
       title: response.title,
       content: response.grounded ? response.content : null,
       unknownScope: response.unknownScope,
@@ -257,6 +260,8 @@ async function askPrecedence() {
               </template>
 
               <template v-else>
+                <p class="muted small">{{ message.modelIdentity?.model || message.model ? `${t('llm.recordedModel')}: ${message.modelIdentity?.model || message.model}` : t('llm.identityUnknown') }}<template v-if="message.modelIdentity"> · {{ message.modelIdentity.profileId }} · {{ message.modelIdentity.provider }}</template></p>
+                <p v-if="message.modelIdentity" class="muted small">{{ t('llm.identityNote') }}</p>
                 <strong>{{ message.content ? pick(message.title) : t('advice.unknown.title') }}</strong>
                 <p v-if="message.content">{{ pick(message.content) }}</p>
                 <p v-else>{{ unknownText(message.unknownScope) }}</p>

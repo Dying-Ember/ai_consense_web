@@ -1,3425 +1,714 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useI18n } from 'vue-i18n'
-import { api, draftingApi, ApiError } from '@/api'
-import type { DraftDocument, DraftProgress, DraftVariable, EvidenceItem, ExtractTrace, TemplateItem } from '@/api/types'
+import type { GraphLocationTarget, GraphNavigation } from '@/drafting/graph-navigation'
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { draftingApi } from '@/api'
+import type { DraftCatalog, DraftDocument, DraftField, DraftGroup, DraftPlan, DraftPlanAction, DraftTargetOverride, DraftUnresolved, DraftVariable, DraftVariablePatch, EvidenceItem, ExtractTrace, TemplateItem } from '@/api'
 import { useAppStore } from '@/stores/app'
-import { useLocalized } from '@/composables/useLocalized'
-import AppIcon from '@/components/AppIcon.vue'
 import AppModal from '@/components/AppModal.vue'
+import DraftingInputField from '@/components/DraftingInputField.vue'
+import DraftingExtractionReport from '@/components/DraftingExtractionReport.vue'
+import DraftingBillDistribution from '@/components/DraftingBillDistribution.vue'
+import DraftingDocumentWorkspace from '@/components/DraftingDocumentWorkspace.vue'
+import DraftingTemplatePreview from '@/components/DraftingTemplatePreview.vue'
+import DraftingValueDisplay from '@/components/DraftingValueDisplay.vue'
+import DraftingUnresolvedItems from '@/components/DraftingUnresolvedItems.vue'
+import DraftingBodyEditor from '@/components/DraftingBodyEditor.vue'
+import { bodyDirty, bodyPatch, createBodyDraft } from '@/drafting/body-edit'
+import { actionForUnresolved, adoptionPatch, applicability, clone, decode, dirtyPatch, documentCapabilities, encode, mergeServerValues, projectDrafts, replaceTargetOverride, restoreDraftView, reversedSiteDates, validationIssue, type DraftValue } from '@/drafting/state'
+import { draftWord, localized, type DraftWord } from '@/drafting/words'
+import { buildBusinessGraph } from '@/drafting/business-graph'
+const DraftingBusinessGraph = defineAsyncComponent(() => import('@/components/DraftingBusinessGraph.vue').then(module => module.default))
 
-const { t } = useI18n()
 const store = useAppStore()
-const { pick, currentKey } = useLocalized()
+const w = (key: DraftWord) => draftWord(key, store.locale)
+const l = (text: Parameters<typeof localized>[0]) => localized(text, store.locale)
+type Step = 'inputs' | 'variables' | 'preview'
 
-type Step = 'inputs' | 'base' | 'files'
 
+const projectId = computed(() => store.activeProjectId)
 const step = ref<Step>('inputs')
+const catalog = ref<DraftCatalog>({ ruleVersion: '', groups: [] })
 const templates = ref<TemplateItem[]>([])
 const inputs = ref<EvidenceItem[]>([])
 const variables = ref<DraftVariable[]>([])
-const progress = ref<DraftProgress | null>(null)
 const documents = ref<DraftDocument[]>([])
+const plan = ref<DraftPlan | null>(null)
 const trace = ref<ExtractTrace | null>(null)
 const traceOpen = ref(false)
-
-const loading = ref(false)
-const extracting = ref(false)
-const generating = ref(false)
-const confirmingFile = ref(false)
+const values = reactive<Record<string, DraftValue>>({})
+const baseline = reactive<Record<string, string>>({})
+const inputSaveStates = reactive<Record<string, 'saving' | 'saved' | 'failed'>>({})
+const busy = ref('')
+const error = ref('')
+const restored = ref(false)
+const search = ref('')
+const statusFilter = ref('all')
+const reviewLayout = ref<'list' | 'focus'>('list')
+const focusedGroupId = ref('')
 const activeFile = ref('NTT')
-const focusMode = ref(false)
-const reviewPaneOpen = ref(false)
-const selectedDocVarKey = ref<string | null>(null)
-/** 第 3 步右栏预览模式：review = 审阅（token 徽标/颜色） / final = 最终稿（只显示替换后文本，隐藏未命中 token） */
-const previewMode = ref<'review' | 'final'>('review')
-const templateInput = ref<HTMLInputElement | null>(null)
-const evidenceInput = ref<HTMLInputElement | null>(null)
+const documentText = ref('')
+const documentBaseline = ref('')
+const editingDocument = ref(false)
+const immersiveDocument = ref(false)
+const documentInfoOpen = ref(false)
+const graphOpen = ref(false)
+const graphNavigation = ref<GraphNavigation>()
+let graphSequence = 0
+let graphInvoker: HTMLElement | undefined
+let graphProject = ''
+const documentWorkspace = ref<HTMLElement>()
+const immersiveToggle = ref<HTMLButtonElement>()
+const documentInfoToggle = ref<HTMLButtonElement>()
+const targetModal = ref<{ $el: HTMLElement }>()
+let targetInvoker: HTMLElement | undefined
+let targetInvokerProject = ''
+const bodyDraft = ref(createBodyDraft(undefined))
+const targetId = ref('')
+const targetAction = ref<DraftTargetOverride['action']>('amend')
+const targetText = ref('')
+const targetSourceMapping = ref('')
+const removalItem = ref<EvidenceItem | null>(null)
+const readingOpen = ref(false)
+const readingFile = ref('NTT')
+const readingKey = ref('')
+const readingActionId = ref('')
+const previewEditKey = ref('')
+let generation = 0, planGeneration = 0
+let alive = true
+let restoreViewPending = true
+let planTimer: ReturnType<typeof setTimeout> | undefined
 
-const projectId = computed(() => store.activeProjectId)
-
-const baseVariables = computed(() => variables.value.filter((item) => item.scope === 'BASE'))
-const fileVariables = computed(() =>
-  variables.value.filter((item) => item.scope === 'FILE' && (!item.fileKey || item.fileKey === activeFile.value))
-)
-/** 影响当前文件的 BASE 变量：在第 3 步左栏作为定位入口（只读，不参与确认计数） */
-const fileBaseVars = computed(() =>
-  baseVariables.value.filter((v) => !v.affects.length || v.affects.includes(activeFile.value))
-)
-const draftFileKeys = ['NTT', 'SCT', 'SCC']
-const activeDocument = computed(() => documents.value.find((doc) => doc.fileKey === activeFile.value) ?? null)
-
-const canLeaveInputs = computed(
-  () => templates.value.some((item) => item.tag === 'ok') || inputs.value.some((item) => item.status === 'PARSED')
-)
-
-const steps = computed(() => [
-  { key: 'inputs', title: t('drafting.wizard.inputs.title'), desc: t('drafting.wizard.inputs.desc'), done: canLeaveInputs.value },
-  { key: 'base', title: t('drafting.wizard.base.title'), desc: t('drafting.wizard.base.desc'), done: !!progress.value?.baseReady },
-  { key: 'files', title: t('drafting.wizard.files.title'), desc: t('drafting.wizard.files.desc'), done: !!progress.value?.allReady }
-])
-
-async function reload() {
-  if (!projectId.value) return
-  loading.value = true
-  try {
-    const [templateList, inputList, variableList, progressData, documentList] = await Promise.all([
-      draftingApi.templates(projectId.value),
-      draftingApi.inputs(projectId.value),
-      draftingApi.variables(projectId.value),
-      draftingApi.progress(projectId.value),
-      draftingApi.documents(projectId.value)
-    ])
-    templates.value = templateList
-    inputs.value = inputList
-    variables.value = variableList
-    progress.value = progressData
-    documents.value = documentList
-    // 识别过程留痕（后端内存态，从未识别过或接口异常时静默置空）
-    trace.value = await draftingApi.extractTrace(projectId.value).catch(() => null)
-  } finally {
-    loading.value = false
-  }
-}
-
-onMounted(reload)
-onMounted(() => window.addEventListener('keydown', onKeydown))
-onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
-watch(projectId, () => {
-  step.value = 'inputs'
-  reload()
+const fields = computed(() => [...catalog.value.groups.flatMap(group => group.fields), ...(catalog.value.systemFields ?? [])])
+const previewEditField = computed(() => fields.value.find(field => field.key === previewEditKey.value))
+const readingFields = computed(() => fields.value.filter(field => !field.hidden))
+const readingStates = computed(() => Object.fromEntries(readingFields.value.map(field => [field.key, state(field)])))
+const readingDirtyKeys = computed(() => readingFields.value.filter(dirty).map(field => field.key))
+const readingSourceAvailable = computed(() => {
+  const tag = templates.value.find(template => template.key === readingFile.value)?.tag
+  return tag === 'missing' ? false : tag === 'ok' ? true : undefined
 })
+const variableMap = computed(() => new Map(variables.value.map(variable => [variable.key, variable])))
+const steps = computed(() => [{ key: 'inputs' as Step, label: w('documents') }, { key: 'variables' as Step, label: w('inputs') }, { key: 'preview' as Step, label: w('preview') }])
+const allTemplates = computed(() => ['NTT', 'SCT', 'SCC'].every(key => templates.value.some(template => template.key === key && template.tag === 'ok')))
+const activeDocument = computed(() => documents.value.find(document => document.fileKey === activeFile.value))
+const documentDirty = computed(() => bodyDirty(activeDocument.value, bodyDraft.value))
+const dirtyInputs = computed(() => fields.value.some(dirty))
+const documentAccess = computed(() => documentCapabilities(activeDocument.value, documentDirty.value))
+const canExport = computed(() => documentAccess.value.exportable)
+const durationKnown = computed(() => values.contractPeriodMonths !== null && values.contractPeriodMonths !== undefined && values.contractPeriodMonths !== '' && Number.isFinite(Number(values.contractPeriodMonths)) && Number(values.contractPeriodMonths) >= 0)
+const durationAdopted = computed(() => durationKnown.value && (dirty(fields.value.find(field => field.key === 'contractPeriodMonths') ?? { key: 'contractPeriodMonths', kind: 'number', label: { en: '', zhHans: '', zhHant: '' } }) || variableMap.value.get('contractPeriodMonths')?.confirmed || variableMap.value.get('contractPeriodMonths')?.manuallyEdited))
+const thresholdPresent = computed(() => values.periodAtLeast39Months !== null && values.periodAtLeast39Months !== undefined && values.periodAtLeast39Months !== '')
+const durationThreshold = computed(() => String(Number(values.contractPeriodMonths) >= 39))
+const durationConflict = computed(() => durationKnown.value && values.periodAtLeast39Months !== null && values.periodAtLeast39Months !== undefined && values.periodAtLeast39Months !== '' && String(values.periodAtLeast39Months) !== durationThreshold.value)
+const actionableFields = computed(() => fields.value.filter(field => !field.hidden && applicability(field.condition, values) !== 'no'))
+const unresolvedInputCount = computed(() => actionableFields.value.filter(field => !field.optional && !['adopted', 'manual'].includes(state(field))).length)
+const adoptedCount = computed(() => actionableFields.value.filter(field => ['adopted', 'manual'].includes(state(field))).length)
+const currentUnresolved = computed<DraftUnresolved[]>(() => step.value === 'preview' ? activeDocument.value?.unresolved ?? [] : plan.value?.unresolved ?? [])
+const selectedTarget = computed(() => plan.value?.actions.find(action => action.id === targetId.value))
+const targetField = computed<DraftField>(() => fields.value.find(field => ['targetOverrides', 'targetEdits'].includes(field.key)) ?? { key: 'targetOverrides', kind: 'list', hidden: true, label: { en: 'Target edits', zhHans: '目标修改', zhHant: '目標修改' } })
+const filteredGroups = computed(() => catalog.value.groups.filter(group => {
+  const needle = search.value.trim().toLowerCase()
+  const matchesText = !needle || [l(group.label), ...group.fields.map(field => `${l(field.label)} ${field.affects?.map(target => `${target.document} ${target.clause}`).join(' ') ?? ''}`)].join(' ').toLowerCase().includes(needle)
+  return matchesText && (statusFilter.value === 'all' || groupState(group) === statusFilter.value)
+}))
+const focusedGroup = computed(() => filteredGroups.value.find(group => group.id === focusedGroupId.value) ?? filteredGroups.value[0])
+const focusedGroupIndex = computed(() => filteredGroups.value.findIndex(group => group.id === focusedGroup.value?.id))
+const displayedGroups = computed(() => reviewLayout.value === 'focus' ? focusedGroup.value ? [focusedGroup.value] : [] : filteredGroups.value)
+function groupNumber(group: DraftGroup) { return catalog.value.groups.findIndex(item => item.id === group.id) + 1 }
+function chooseGroup(id: string) { if (filteredGroups.value.some(group => group.id === id)) { focusedGroupId.value = id; snapshotDraft(projectId.value) } }
+function changeReviewLayout(layout: 'list' | 'focus') { focusedGroupId.value = focusedGroup.value?.id ?? ''; reviewLayout.value = layout; snapshotDraft(projectId.value) }
+function moveQuestion(offset: number) { const group = filteredGroups.value[focusedGroupIndex.value + offset]; if (group) chooseGroup(group.id) }
 
-function gotoStep(next: Step) {
-  if (next === 'base' && !canLeaveInputs.value) {
-    store.notify(t('drafting.gates.needInputs'))
-    return
-  }
-  if (next === 'files' && !progress.value?.baseReady) {
-    store.notify(t('drafting.gates.needBase'))
-    return
-  }
-  step.value = next
+function derivedInput(field: DraftField) { return field.key === 'periodAtLeast39Months' && durationAdopted.value && thresholdPresent.value && !durationConflict.value }
+function inputDisabled(field: DraftField) { return !!busy.value || applicability(field.condition, values) === 'no' || derivedInput(field) }
+function previewAdoptable(field: DraftField) {
+  const variable = variableMap.value.get(field.key)
+  return !dirty(field) && encode(field, values[field.key]).trim() !== '' && validationIssue(field, values[field.key]) === null && !variable?.validationIssue && applicability(field.condition, values) !== 'no' && (state(field) === 'suggested' || !!variable?.reviewRequired)
 }
-
-async function uploadTemplates(event: Event) {
-  const files = Array.from((event.target as HTMLInputElement).files ?? [])
-  if (!files.length) return
-  await runTask(t('common.loading'), async () => {
-    const result = await draftingApi.uploadTemplates(projectId.value, files)
-    store.notify(result.messages.join('\n') || t('common.done'), 5000)
-    await reload()
+function dirty(field: DraftField) { return encode(field, values[field.key]) !== (baseline[field.key] ?? '') }
+function inputSaveStatus(field: DraftField): DraftWord | undefined {
+  const status = inputSaveStates[field.key]
+  if (status === 'saving') return 'savingInput'
+  if (dirty(field)) return status === 'failed' ? 'saveInputFailed' : 'unsaved'
+  return status === 'saved' ? 'savedInput' : undefined
+}
+function state(field: DraftField): DraftWord {
+  if (applicability(field.condition, values) === 'no') return 'inactive'
+  const variable = variableMap.value.get(field.key)
+  const issue = validationIssue(field, values[field.key])
+  if (issue === 'missing') return variable?.adoptionState === 'conflict' && !dirty(field) ? 'conflict' : 'missing'
+  if (issue || variable?.reviewRequired || variable?.validationIssue || ['siteInspectionStartDate', 'siteInspectionEndDate'].includes(field.key) && reversedSiteDates(values) || ['contractPeriodMonths', 'periodAtLeast39Months'].includes(field.key) && durationConflict.value || applicability(field.condition, values) === 'unknown' && values[field.key] !== null && values[field.key] !== undefined && values[field.key] !== '') return 'needs_review'
+  if (variable?.adoptionState === 'conflict' && !dirty(field)) return 'conflict'
+  if (dirty(field)) return 'manual'
+  if (variable?.manuallyEdited && values[field.key] !== null && values[field.key] !== undefined && values[field.key] !== '') return 'manual'
+  if (variable?.confirmed || variable?.adoptionState === 'adopted') return 'adopted'
+  return values[field.key] !== null && values[field.key] !== undefined && values[field.key] !== '' ? 'suggested' : 'missing'
+}
+function groupState(group: DraftGroup): DraftWord {
+  const active = group.fields.filter(field => applicability(field.condition, values) !== 'no' && !field.optional)
+  if (!active.length) return 'inactive'
+  const states = active.map(state)
+  for (const status of ['needs_review', 'conflict', 'missing', 'suggested'] as DraftWord[]) if (states.includes(status)) return status
+  return states.includes('manual') ? 'manual' : 'adopted'
+}
+function visibleFields(group: DraftGroup) { return group.fields.filter(field => !field.hidden && applicability(field.condition, values) !== 'no') }
+function relatedActions(group: DraftGroup) {
+  const keys = new Set(group.fields.map(field => field.key))
+  return plan.value?.actions.filter(action => (action.inputKeys ?? action.fieldKeys ?? []).some(key => keys.has(key))) ?? []
+}
+function rawValues() { return dirtyPatch(fields.value, values, baseline) }
+function snapshotDraft(id: string) {
+  if (!id || !fields.value.length) return
+  const docs = clone(projectDrafts.get(id)?.documents ?? {})
+  if (documentDirty.value) docs[activeFile.value] = { content: documentText.value, baseline: documentBaseline.value, body: clone(bodyDraft.value) }
+  else delete docs[activeFile.value]
+  projectDrafts.set(id, { values: clone(values), baseline: clone(baseline), documents: docs, view: { step: step.value, activeFile: activeFile.value, review: { layout: reviewLayout.value, groupId: focusedGroupId.value }, reading: readingOpen.value ? { fileKey: readingFile.value, selectedKey: readingKey.value, selectedActionId: readingActionId.value } : undefined } })
+}
+function loadDocument(preserve = true) {
+  if (preserve && documentDirty.value) return
+  const pending = projectDrafts.get(projectId.value)?.documents?.[activeFile.value]
+  documentText.value = pending?.content ?? activeDocument.value?.content ?? ''
+  documentBaseline.value = pending?.baseline ?? activeDocument.value?.content ?? ''
+  bodyDraft.value = pending?.body ? clone(pending.body) : createBodyDraft(activeDocument.value)
+  editingDocument.value = !!pending
+  if (pending) restored.value = true
+}
+function initialize(list: DraftVariable[]) {
+  const merged = mergeServerValues(fields.value, list, values, baseline)
+  variables.value = list
+  for (const key of Object.keys(values)) if (!(key in merged.values)) delete values[key]
+  Object.assign(values, merged.values); Object.assign(baseline, merged.baseline)
+}
+function update(field: DraftField, value: DraftValue) {
+  if (inputDisabled(field)) return
+  delete inputSaveStates[field.key]
+  values[field.key] = value
+  if (field.key === 'contractPeriodMonths' && durationKnown.value) values.periodAtLeast39Months = durationThreshold.value
+  snapshotDraft(projectId.value)
+}
+function discard(group: DraftGroup) { for (const field of group.fields) values[field.key] = decode(field, baseline[field.key]); snapshotDraft(projectId.value) }
+function current(id: string, token: number) { return alive && id === projectId.value && token === generation }
+async function action(label: string, task: (id: string, token: number) => Promise<void>) {
+  if (busy.value || !projectId.value) return
+  const id = projectId.value, token = generation
+  busy.value = label; error.value = ''
+  try { await task(id, token) }
+  catch (caught) { if (current(id, token)) error.value = caught instanceof Error ? caught.message : String(caught) }
+  finally { if (current(id, token)) busy.value = '' }
+}
+async function updatePlan() {
+  if (!projectId.value || !fields.value.length) return
+  const sequence = ++planGeneration, id = projectId.value, token = generation
+  try { const result = await draftingApi.plan(id, dirtyInputs.value ? rawValues() : undefined); if (sequence === planGeneration && current(id, token)) plan.value = result }
+  catch (caught) { if (sequence === planGeneration && current(id, token)) error.value = caught instanceof Error ? caught.message : String(caught) }
+}
+async function refresh(id: string, token: number) {
+  const [schema, list] = await Promise.all([draftingApi.catalog(id), draftingApi.variables(id)])
+  if (!current(id, token)) return
+  catalog.value = schema
+  const cached = projectDrafts.get(id)
+  if (!Object.keys(values).length && cached) { Object.assign(values, clone(cached.values)); Object.assign(baseline, clone(cached.baseline)); restored.value = schema.groups.some(group => group.fields.some(field => encode(field, values[field.key]) !== (baseline[field.key] ?? ''))) }
+  initialize(list)
+  const [ts, ins, docs, tr] = await Promise.all([draftingApi.templates(id), draftingApi.inputs(id), draftingApi.documents(id), draftingApi.extractTrace(id)])
+  if (!current(id, token)) return
+  templates.value = ts; inputs.value = ins; documents.value = docs; trace.value = tr
+  if (restoreViewPending) {
+    restoreViewPending = false
+    const view = restoreDraftView(cached?.view, docs)
+    reviewLayout.value = view.review?.layout ?? 'list'
+    focusedGroupId.value = schema.groups.some(group => group.id === view.review?.groupId) ? view.review!.groupId : schema.groups[0]?.id ?? ''
+    activeFile.value = view.activeFile; step.value = view.step; loadDocument(false)
+    if (view.reading) { readingOpen.value = true; readingFile.value = view.reading.fileKey; readingKey.value = view.reading.selectedKey; readingActionId.value = view.reading.selectedActionId }
+  }
+  await updatePlan()
+}
+async function saveField(id: string, token: number, field: DraftField, patch: DraftVariablePatch) {
+  const updated = await draftingApi.updateVariable(id, field.key, patch)
+  if (!current(id, token)) return
+  variables.value = [...variables.value.filter(variable => variable.key !== updated.key), updated]
+  values[field.key] = decode(field, updated.value); baseline[field.key] = updated.value ?? ''; snapshotDraft(id)
+}
+async function persistDirty(id: string, token: number, subset = fields.value) { for (const field of subset) { if (!current(id, token)) return; if (dirty(field)) await saveField(id, token, field, { value: encode(field, values[field.key]) }) } }
+async function saveGroup(group?: DraftGroup) { await action(w('saving'), async (id, token) => { await persistDirty(id, token, group?.fields); if (current(id, token)) await refresh(id, token) }) }
+async function saveInput(field: DraftField) {
+  if (!dirty(field) || applicability(field.condition, values) === 'no') return
+  await action(w('saving'), async (id, token) => {
+    inputSaveStates[field.key] = 'saving'
+    try { await persistDirty(id, token, [field]) }
+    catch (caught) { if (current(id, token)) inputSaveStates[field.key] = 'failed'; throw caught }
+    if (!current(id, token)) return
+    inputSaveStates[field.key] = 'saved'
+    await refresh(id, token)
   })
-  if (templateInput.value) templateInput.value.value = ''
 }
-
-async function uploadInputs(event: Event) {
-  const files = Array.from((event.target as HTMLInputElement).files ?? [])
-  if (!files.length) return
-  await runTask(t('common.loading'), async () => {
-    const result = await draftingApi.uploadInputs(projectId.value, files)
-    store.notify(result.messages.join('\n') || t('common.done'), 5000)
-    await reload()
+async function adopt(field: DraftField, candidateIndex?: number) {
+  await action(w('saving'), async (id, token) => {
+    const patch = adoptionPatch(encode(field, values[field.key]), baseline[field.key] ?? '', !!variableMap.value.get(field.key)?.reviewRequired, candidateIndex)
+    await saveField(id, token, field, patch)
+    if (current(id, token)) await refresh(id, token)
   })
-  if (evidenceInput.value) evidenceInput.value.value = ''
 }
-
-// ------------------------------------------------------------ 删除沟通证据
-const deleteEvidenceOpen = ref(false)
-const deleteEvidenceTarget = ref<EvidenceItem | null>(null)
-
-function askDeleteInput(item: EvidenceItem) {
-  deleteEvidenceTarget.value = item
-  deleteEvidenceOpen.value = true
+async function upload(event: Event, target: 'templates' | 'inputs', key?: string) {
+  const el = event.target as HTMLInputElement, files = Array.from(el.files ?? []); el.value = ''; if (!files.length) return
+  await action(w('uploading'), async (id, token) => { const result = key ? await draftingApi.replaceTemplate(id, key, files[0]!) : target === 'templates' ? await draftingApi.uploadTemplates(id, files) : await draftingApi.uploadInputs(id, files); if (!current(id, token)) return; store.notify(`${result.parsed}/${result.accepted} ${w('parsed')}`); await refresh(id, token); if (result.failed && current(id, token)) error.value = result.messages.join('\n') })
 }
-
-async function confirmDeleteInput() {
-  const target = deleteEvidenceTarget.value
-  if (!target?.id) return
-  await runTask(t('common.loading'), async () => {
-    await draftingApi.deleteInput(projectId.value, target.id!)
-    store.notify(t('common.deleted'), 3000)
-    await reload()
+async function removeCorrespondence() {
+  const item = removalItem.value
+  if (item?.id === null || item?.id === undefined) return
+  await action(w('saving'), async (id, token) => {
+    await draftingApi.deleteInput(id, item.id!)
+    if (!current(id, token)) return
+    removalItem.value = null
+    await refresh(id, token)
   })
-  deleteEvidenceOpen.value = false
-  deleteEvidenceTarget.value = null
 }
-
-// ------------------------------------------------------------ 第 1 步：替换标准模板（原型「替换 NTT / SCT / SCC」）
-const templateReplaceInput = ref<HTMLInputElement | null>(null)
-const pendingReplaceKey = ref('')
-
-function startReplaceTemplate(key: string) {
-  pendingReplaceKey.value = key
-  if (templateReplaceInput.value) {
-    templateReplaceInput.value.value = ''
-    templateReplaceInput.value.click()
-  }
-}
-
-async function replaceTemplate(event: Event) {
-  const file = (event.target as HTMLInputElement).files?.[0]
-  const key = pendingReplaceKey.value
-  if (!file || !key) return
-  await runTask(t('common.loading'), async () => {
-    const result = await draftingApi.replaceTemplate(projectId.value, key, file)
-    // 单文件替换 → 只清该文件的 OCR 缓存
-    clearOcrCache(key)
-    store.notify(result.messages.join('\n') || t('common.done'), 5000)
-    await reload()
-  })
-  if (templateReplaceInput.value) templateReplaceInput.value.value = ''
-  pendingReplaceKey.value = ''
-}
-
-/** 生成"带 {{key}} 占位符的空白模板草稿"，方便用户改写原 PDF/Word 后重新上传 */
-function downloadBlankTemplate() {
-  const lines: string[] = []
-  lines.push('# 空白 NTT 模板占位符清单（草稿）')
-  lines.push('')
-  lines.push('本文件由 ConSense 自动生成，按下方 key 名把 NTT 合同范本中需要填空的位置')
-  lines.push('改成对应的 `{{key}}` 标记，然后导出 PDF / DOCX 再上传到第 1 步。')
-  lines.push('')
-  lines.push('> 提示：')
-  lines.push('> 1. 在原 PDF 中填加占位符可以用 Adobe Acrobat、福昕、PDFescape 等 PDF 编辑器；')
-  lines.push('> 2. 也可以复制原 NTT 文本到 Word，加上占位符后另存为 PDF；')
-  lines.push('> 3. 第 3 步会自动 OCR 找到这些占位符并联动。')
-  lines.push('')
-  lines.push('## 全局变量（影响 NTT / SCT / SCC 三份文件）')
-  lines.push('')
-  for (const v of variables.value.filter(v => v.scope === 'BASE')) {
-    const label = pick(v.label) || v.key
-    const sample = (v.result || v.value || v.choice || '').toString().trim()
-    lines.push(`- **${label}**  {{${v.key}}}`)
-    if (sample) lines.push(`  - 示例值：${sample.length > 60 ? sample.slice(0, 60) + '…' : sample}`)
-    lines.push(`  - action=${v.action}`)
-  }
-  lines.push('')
-  lines.push('## NTT 专属变量（影响 NTT）')
-  lines.push('')
-  for (const v of variables.value.filter(v => v.scope === 'FILE' && v.fileKey === 'NTT')) {
-    const label = pick(v.label) || v.key
-    const sample = (v.result || v.value || v.choice || '').toString().trim()
-    lines.push(`- **${label}**  {{${v.key}}}`)
-    if (sample) lines.push(`  - 示例值：${sample.length > 60 ? sample.slice(0, 60) + '…' : sample}`)
-    lines.push(`  - action=${v.action}`)
-  }
-  lines.push('')
-  lines.push('## 占位符使用示例')
-  lines.push('')
-  lines.push('原文（香港房委会 Notes to Tenderers 摘录）：')
-  lines.push('```')
-  lines.push('This standard documentation is for lump sum building contracts with firm')
-  lines.push('bills of quantities. This standard documentation is to be used in')
-  lines.push('conjunction with: (a) Hong Kong Housing Authority General Conditions of Contract')
-  lines.push('for Building Works 2013 Edition (version 1.1); ...')
-  lines.push('```')
-  lines.push('')
-  lines.push('改成带占位符的空白模板（在 NTT 顶端加"项目信息"一节）：')
-  lines.push('```')
-  const ct = variables.value.find(v => v.key === 'contractTitle')
-  if (ct) lines.push(`Project Title: {{contractTitle}}`)
-  const wt = variables.value.find(v => v.key === 'worksType')
-  if (wt) lines.push(`Type of Works: {{worksType}}`)
-  lines.push('')
-  lines.push('This standard documentation is for lump sum building contracts with firm')
-  lines.push('bills of quantities, in respect of the Works as defined in the Conditions of')
-  lines.push('Contract. Tendering system for this Contract: {{electronicTendering}}.')
-  const fi = variables.value.find(v => v.key === 'foundationIncluded')
-  if (fi) lines.push(`Foundation works included: {{foundationIncluded}}.`)
-  lines.push('```')
-  lines.push('')
-  lines.push('—— END ——')
-
-  const content = lines.join('\n')
-  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = `blank-template-NTT-${new Date().toISOString().slice(0, 10)}.txt`
-  a.click()
-  URL.revokeObjectURL(url)
-  store.notify(t('drafting.templates.blankDownloaded'), 4000)
-}
-
 async function extract() {
-  extracting.value = true
-  store.setBusy(t('drafting.variables.extracting'))
-  try {
-    variables.value = await draftingApi.extract(projectId.value)
-    progress.value = await draftingApi.progress(projectId.value)
-    trace.value = await draftingApi.extractTrace(projectId.value).catch(() => null)
-    store.notify(t('common.done'))
-  } finally {
-    extracting.value = false
-    store.clearBusy()
-  }
-}
-
-function formatTraceTime(iso: string): string {
-  const date = new Date(iso)
-  return Number.isNaN(date.getTime()) ? iso : date.toLocaleString()
-}
-
-async function saveVariable(
-  variable: DraftVariable,
-  patch: { value?: string; choice?: string; confirmed?: boolean; note?: string; result?: string }
-) {
-  let updated: DraftVariable
-  try {
-    updated = await draftingApi.updateVariable(projectId.value, variable.key, patch)
-  } catch (err: any) {
-    // 后端没有该变量（变量列表过期，或 PDF token 引用了未抽取的 key）→ 自动补建 FILE 变量后重试
-    if (err instanceof ApiError && err.code === 4006) {
-      await draftingApi.createVariable(projectId.value, {
-        key: variable.key,
-        fileKey: variable.fileKey || activeFile.value,
-        labelZhHans: pick(variable.label) || variable.key,
-        labelEn: variable.label?.en || variable.key,
-        action: variable.action || 'fill',
-        options: (variable.options ?? []).map((o) => pick(o)).filter(Boolean),
-        value: variable.value,
-        reason: 'PDF token 引用但后端变量缺失，自动补建'
-      })
-      updated = await draftingApi.updateVariable(projectId.value, variable.key, patch)
-    } else {
-      throw err
-    }
-  }
-  const index = variables.value.findIndex((item) => item.key === updated.key)
-  if (index >= 0) variables.value.splice(index, 1, updated)
-  else variables.value.push(updated)
-  progress.value = await draftingApi.progress(projectId.value)
-  // 保存成功后：watch(variables) → regenerateHtml() 自动重新生成所有 token 的当前取值显示
-  // + 滚动到该变量在 PDF 中的影响点
-  void locateTokenInEditor(updated.key)
-}
-
-// ------------------------------------------------------------ 第 3 步：文档渲染（PDF.js 文本层 → HTML 流式布局）
-interface PdfPageInfo {
-  pageNum: number
-  width: number
-  height: number
-  imgUrl: string                 // PDF.js canvas 渲染出的整页图片（真实 PDF 外观）
-  html: string                  // 变量 overlay HTML，只含 token <span class="hit" data-hit-var="KEY">，不含正文
-  ocrStatus: 'pending' | 'done' | 'error' | null
-}
-const pdfBlobUrl = ref('')
-const pdfLoading = ref(false)
-const pdfError = ref('')
-const pdfPages = ref<PdfPageInfo[]>([])
-const pdfScrollContainer = ref<HTMLElement | null>(null)
-let pdfObjectUrl = ''
-let pdfDoc: any = null
-let pdfRenderSeq = 0
-let pdfjsLib: any = null
-const PDF_SCALE = 1.35
-
-// ------------------------------------------------------------ DOCX 模板渲染（mammoth → HTML，{{KEY}} 包 hit 徽标复用联动跳转）
-const docxRawHtml = ref('')   // mammoth 转换出的原始 HTML
-const docxHtml = ref('')      // 处理后 HTML（{{KEY}} → <span class="hit" data-hit-var>）
-let docxRenderSeq = 0
-let mammothLib: any = null
-
-/** 模板文件是否为 DOCX/TXT/MD（否则按 PDF 处理） */
-function isDocxTemplate(fileKey: string): boolean {
-  const item = templates.value.find((tm) => tm.key === fileKey)
-  const name = (item?.fileName ?? '').toLowerCase()
-  return name.endsWith('.docx') || name.endsWith('.doc') || name.endsWith('.txt') || name.endsWith('.md')
-}
-
-async function ensureMammoth() {
-  if (mammothLib) return mammothLib
-  // 用 mammoth 自带浏览器打包版（依赖全内联），避免 lib 入口里的 Node 依赖（fs/path）在浏览器失败
-  const mod: any = await import('mammoth/mammoth.browser.min.js')
-  mammothLib = mod.default ?? mod
-  return mammothLib
-}
-
-function releaseDocx() {
-  docxRawHtml.value = ''
-  docxHtml.value = ''
-  pdfError.value = ''
-}
-
-function releaseAllPreview() {
-  releasePdf()
-  releaseDocx()
-}
-
-async function ensurePdfJs() {
-  if (pdfjsLib) return pdfjsLib
-  const mod: any = await import('pdfjs-dist')
-  pdfjsLib = mod.default ?? mod
-  if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-    const worker: any = await import('pdfjs-dist/build/pdf.worker.min.mjs?url')
-    pdfjsLib.GlobalWorkerOptions.workerSrc = worker.default ?? worker
-  }
-  return pdfjsLib
-}
-
-function releasePdf() {
-  if (pdfObjectUrl) {
-    URL.revokeObjectURL(pdfObjectUrl)
-    pdfObjectUrl = ''
-  }
-  // 释放每页 canvas 图片的 object URL
-  for (const r of pageRaws.value) {
-    if (r.imgUrl) URL.revokeObjectURL(r.imgUrl)
-  }
-  pdfBlobUrl.value = ''
-  pdfError.value = ''
-  pdfPages.value = []
-  pageRaws.value = []
-  ocrProgress.value = { current: 0, total: 0, status: '' }
-  if (pdfDoc) {
-    try { pdfDoc.destroy() } catch { /* noop */ }
-    pdfDoc = null
-  }
-  void releaseTessWorker()
-}
-
-async function loadPdf() {
-  const requestKey = activeFile.value
-  const seq = ++pdfRenderSeq
-  releasePdf()
-  if (!projectId.value || !draftFileKeys.includes(requestKey)) return
-  pdfLoading.value = true
-  try {
-    const blob = await api.blob(`/drafting/${projectId.value}/templates/${requestKey}/preview.pdf`)
-    if (seq !== pdfRenderSeq || activeFile.value !== requestKey) return
-    pdfObjectUrl = URL.createObjectURL(blob)
-    pdfBlobUrl.value = pdfObjectUrl
-    await renderPdfPages(seq)
-  } catch (err: any) {
-    if (seq === pdfRenderSeq) {
-      const biz = err?.response?.data?.message as string | undefined
-      pdfError.value = biz || t('drafting.files.previewFailed')
-    }
-  } finally {
-    if (seq === pdfRenderSeq) pdfLoading.value = false
-  }
-}
-
-/** 加载 DOCX 模板：后端 /templates/{key}/preview.pdf 原样回传文件字节（docx），mammoth 转 HTML 预览 */
-async function loadDocx() {
-  const requestKey = activeFile.value
-  const seq = ++docxRenderSeq
-  releaseDocx()
-  if (!projectId.value || !draftFileKeys.includes(requestKey)) return
-  pdfLoading.value = true
-  try {
-    const blob = await api.blob(`/drafting/${projectId.value}/templates/${requestKey}/preview.pdf`)
-    if (seq !== docxRenderSeq || activeFile.value !== requestKey) return
-    const lib = await ensureMammoth()
-    const arrayBuffer = await blob.arrayBuffer()
-    const result = await lib.convertToHtml({ arrayBuffer })
-    if (seq !== docxRenderSeq || activeFile.value !== requestKey) return
-    docxRawHtml.value = result.value || ''
-    renderDocxHtml()
-    if (seq === docxRenderSeq) pdfError.value = ''
-  } catch (err: any) {
-    if (seq === docxRenderSeq) {
-      const biz = err?.response?.data?.message as string | undefined
-      const rawErr = typeof err === 'string' ? err : (err?.stack || err?.message || JSON.stringify(err) || String(err))
-      pdfError.value = biz || rawErr || t('drafting.files.previewFailed')
-      try { console.error('[DOCX] render failed:', err) } catch { /* noop */ }
-    }
-  } finally {
-    if (seq === docxRenderSeq) pdfLoading.value = false
-  }
-}
-
-/** token 纯文本版：与 tokenDisplayHtml 同逻辑，但用于 docx 内联 span（textContent 不能含 HTML） */
-function tokenTextContent(v: DraftVariable | null, key: string, mode: 'review' | 'final'): string {
-  if (!v) return `{{${key}}}`
-  if (v.action === 'delete' || v.action === 'notused') return mode === 'final' ? '' : '×'
-  const r = (v.result || v.choice || v.value || '').trim()
-  if (r && (mode === 'final' || v.confirmed)) return r
-  return `{{${key}}}`
-}
-
-/** DOCX 变量定位词表：模板没有 {{KEY}} 占位符时，按这些英文术语在正文中定位变量影响段。
- *  只收录强相关的模板术语，避免泛词误标（如 works / bill / system）。 */
-const VAR_LOCATE_TERMS: Record<string, string[]> = {
-  contractTitle: ['contract no.', 'contract title', 'title of contract', 'contract number'],
-  worksType: ['type of works', 'nature of works'],
-  fundingArrangement: ['tender a', 'tender b', 'funding arrangement'],
-  billNos: ['bill of quantities', 'bills of quantities', 'bill no.'],
-  subcontractors: ['sub-contract', 'subcontract', 'nominated sub'],
-  twoEnvelopeSystem: ['two-envelope', 'two envelope'],
-  foundationIncluded: ['foundation works', 'foundation and'],
-  contractPeriod39Months: ['39 month', '39-month', 'period of completion', 'time for completion'],
-}
-
-/** DOCX HTML：把 {{KEY}} 包成 <span class="hit" data-hit-var="KEY">，与 PDF overlay 同结构，locateTokenInEditor 无缝复用。
- *  模板无占位符时，按 VAR_LOCATE_TERMS 在正文中定位变量影响段，生成弱锚点 hit-loose（只定位、不改写文本）。 */
-function renderDocxHtml() {
-  const raw = docxRawHtml.value
-  if (!raw) {
-    docxHtml.value = ''
-    return
-  }
-  const byKey = new Map(variables.value.map((v) => [v.key, v] as const))
-  // 每个 key 的定位词（预置术语 + key 驼峰拆分短语）
-  const locateTerms = new Map<string, string[]>()
-  for (const v of variables.value) {
-    const terms: string[] = []
-    const preset = VAR_LOCATE_TERMS[v.key]
-    if (preset) terms.push(...preset)
-    const camelSplit = v.key.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().trim()
-    if (camelSplit.length > 3 && !terms.includes(camelSplit)) terms.push(camelSplit)
-    if (terms.length) locateTerms.set(v.key, terms)
-  }
-  const doc = new DOMParser().parseFromString(raw, 'text/html')
-  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT)
-  const textNodes: Text[] = []
-  while (walker.nextNode()) textNodes.push(walker.currentNode as Text)
-  const tokenRe = /\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g
-  for (const node of textNodes) {
-    const text = node.nodeValue ?? ''
-    const frag = doc.createDocumentFragment()
-    let cursor = 0
-    let changed = false
-    // 1) {{KEY}} 精确占位符
-    tokenRe.lastIndex = 0
-    let m: RegExpExecArray | null
-    while ((m = tokenRe.exec(text)) !== null) {
-      if (m.index > cursor) frag.appendChild(doc.createTextNode(text.slice(cursor, m.index)))
-      const key = m[1]
-      const v = byKey.get(key) ?? null
-      const span = doc.createElement('span')
-      span.className = 'hit ' + tokenCssClass(v)
-      span.setAttribute('data-hit-var', key)
-      span.textContent = tokenTextContent(v, key, previewMode.value)
-      frag.appendChild(span)
-      cursor = m.index + m[0].length
-      changed = true
-    }
-    // 2) 无 {{KEY}} 时：术语定位锚点（弱样式，每节点最多命中一个 key，避免过度标注）
-    if (!changed && locateTerms.size) {
-      const lower = text.toLowerCase()
-      for (const [key, terms] of locateTerms) {
-        let placed = false
-        for (const term of terms) {
-          const rawIdx = lower.indexOf(term.toLowerCase())
-          if (rawIdx < 0 || rawIdx < cursor) continue
-          // 边界词界检查，避免子串误标（如 foundation 命中 foundationless）
-          const before = rawIdx === 0 ? '' : lower[rawIdx - 1]
-          const afterChar = lower[rawIdx + term.length] ?? ''
-          if (before && /[a-z0-9]/.test(before)) continue
-          if (afterChar && /[a-z0-9]/.test(afterChar)) continue
-          if (rawIdx > cursor) frag.appendChild(doc.createTextNode(text.slice(cursor, rawIdx)))
-          const span = doc.createElement('span')
-          span.className = 'hit hit-loose'
-          span.setAttribute('data-hit-var', key)
-          span.textContent = text.slice(rawIdx, rawIdx + term.length)
-          frag.appendChild(span)
-          cursor = rawIdx + term.length
-          // 值徽标：choice/fill 变量的就地取值入口（不破坏模板原文）；list 变量跳过，避免破坏清单 JSON
-          const v = byKey.get(key)
-          if (v && v.kind !== 'list' && (v.options.length > 0 || v.action === 'fill')) {
-            const badge = doc.createElement('span')
-            badge.className = 'hit-value-badge'
-            badge.setAttribute('data-hit-key', key)
-            const cur = (v.result || v.choice || v.value || '').trim()
-            badge.textContent = cur || '待选'
-            frag.appendChild(badge)
-          }
-          changed = true
-          placed = true
-          break
+  const llmSelection = store.captureLlmSelection()
+  await action(w('extracting'), async (id, token) => {
+    await persistDirty(id, token); if (!current(id, token)) return
+    const previousTrace = trace.value
+    try { await draftingApi.extract(id, llmSelection) }
+    catch (caught) {
+      if (current(id, token)) {
+        trace.value = null
+        try {
+          const failedTrace = await draftingApi.extractTrace(id)
+          const newer = failedTrace && (failedTrace.runId ? failedTrace.runId !== previousTrace?.runId : failedTrace.finishedAt !== previousTrace?.finishedAt)
+          if (current(id, token) && newer) trace.value = failedTrace
         }
-        if (placed) break
+        catch { /* Keep the extraction error; an earlier report must not masquerade as this failed run. */ }
       }
+      throw caught
     }
-    if (changed && cursor < text.length) frag.appendChild(doc.createTextNode(text.slice(cursor)))
-    if (changed) node.parentNode?.replaceChild(frag, node)
-  }
-  docxHtml.value = doc.body.innerHTML
-}
-
-/** 统一入口：按模板类型分流（docx → mammoth HTML；pdf → PDF.js canvas） */
-function loadPreview() {
-  releaseAllPreview()
-  if (isDocxTemplate(activeFile.value)) {
-    void loadDocx()
-  } else {
-    void loadPdf()
-  }
-}
-
-async function renderPdfPages(seq: number) {
-  const lib = await ensurePdfJs()
-  const task = lib.getDocument(pdfBlobUrl.value)
-  pdfDoc = await task.promise
-  if (seq !== pdfRenderSeq) return
-  const total = pdfDoc.numPages
-
-  const raws: PageRaw[] = []
-  for (let i = 1; i <= total; i++) {
-    const page = await pdfDoc.getPage(i)
-    if (seq !== pdfRenderSeq) return
-    const viewport = page.getViewport({ scale: PDF_SCALE })
-
-    // 1) 真实 PDF 页 → canvas → 图片（扫描件 / 文字层通用的唯一渲染方式，所见即所得）
-    const canvas = document.createElement('canvas')
-    canvas.width = Math.floor(viewport.width)
-    canvas.height = Math.floor(viewport.height)
-    const ctx = canvas.getContext('2d')!
-    await page.render({ canvasContext: ctx, viewport }).promise
-    if (seq !== pdfRenderSeq) return
-    const imgUrl = await new Promise<string>((resolve) => {
-      canvas.toBlob((blob) => resolve(blob ? URL.createObjectURL(blob) : ''), 'image/png')
-    })
-
-    // 2) 取文字层（有则用于变量 overlay 精确定位；无则该页只有 canvas 图）
-    const text = await page.getTextContent()
-    if (seq !== pdfRenderSeq) {
-      if (imgUrl) URL.revokeObjectURL(imgUrl)
-      return
-    }
-    const items = text.items as any[]
-
-    raws.push({ pageNum: i, source: 'pdf', items, viewport, ocrStatus: null, imgUrl })
-    // 渐进式上屏：每渲染完一页立即可见
-    pageRaws.value = [...raws]
-    regenerateHtml()
-  }
-
-  console.log(`[PDF] canvas 渲染完成 ${raws.length} 页（不使用 OCR）`)
-}
-
-// ------------------------------------------------------------ OCR（对没文字层的扫描页做 tesseract.js OCR）
-let tessWorker: any = null
-let tessLoading: Promise<any> | null = null
-const ocrEnabled = ref(true)         // 是否启用 OCR（开关，留给用户控制）
-const ocrProgress = ref({ current: 0, total: 0, status: '' as '' | 'idle' | 'loading' | 'running' | 'done' | 'error' | '' })
-
-async function ensureTessWorker() {
-  if (tessWorker) return tessWorker
-  if (tessLoading) return tessLoading
-  ocrProgress.value = { current: 0, total: 0, status: 'loading' }
-  console.log('[OCR] initializing tesseract worker...')
-  tessLoading = (async () => {
-    try {
-      const mod: any = await import('tesseract.js')
-      console.log('[OCR] tesseract.js module loaded', mod)
-      const Tess = mod.default ?? mod
-      // eng 模型支持简体/繁体/英文混合扫描件。模型从 CDN 首次下载 ~10MB
-      const w = await Tess.createWorker('eng')
-      tessWorker = w
-      ocrProgress.value.status = ''
-      console.log('[OCR] tesseract worker ready')
-      return w
-    } catch (err) {
-      console.warn('[OCR] tesseract worker init failed:', err)
-      ocrProgress.value = { current: 0, total: 0, status: 'error' }
-      return null
-    } finally {
-      tessLoading = null
-    }
-  })()
-  return tessLoading
-}
-
-/* ----------------------- OCR 结果缓存（sessionStorage）-----------------------
- * 同一文件第二次进入时直接复用上次结果，避免反复扫描。文件版本号变化（替换模板后）
- * 用 fileKey + 上传时间作为缓存键的一部分隔离。手动调用 clearOcrCache() 可重跑。 */
-const OCR_CACHE_PREFIX = 'consense-ocr'
-function ocrCacheKey(fileKey: string, pageNum: number): string {
-  return `${OCR_CACHE_PREFIX}:${fileKey}:${pageNum}`
-}
-function getCachedOcr(fileKey: string, pageNum: number): any[] | null {
-  try {
-    const raw = sessionStorage.getItem(ocrCacheKey(fileKey, pageNum))
-    return raw ? JSON.parse(raw) : null
-  } catch { return null }
-}
-function setCachedOcr(fileKey: string, pageNum: number, words: any[]): void {
-  try { sessionStorage.setItem(ocrCacheKey(fileKey, pageNum), JSON.stringify(words)) }
-  catch { /* 容量溢出时静默丢弃，下次会重跑 */ }
-}
-function clearOcrCache(fileKey?: string): void {
-  try {
-    if (fileKey) {
-      for (let i = sessionStorage.length - 1; i >= 0; i--) {
-        const k = sessionStorage.key(i)
-        if (k && k.startsWith(`${OCR_CACHE_PREFIX}:${fileKey}:`)) sessionStorage.removeItem(k)
-      }
-    } else {
-      for (let i = sessionStorage.length - 1; i >= 0; i--) {
-        const k = sessionStorage.key(i)
-        if (k && k.startsWith(`${OCR_CACHE_PREFIX}:`)) sessionStorage.removeItem(k)
-      }
-    }
-  } catch { /* noop */ }
-}
-
-async function ocrAllPages() {
-  if (!ocrEnabled.value) { console.log('[OCR] disabled'); return }
-  const targets = pageRaws.value.filter(p => p.ocrStatus === 'pending')
-  console.log('[OCR] ocrAllPages targets=', targets.length)
-  if (!targets.length) return
-  const worker = await ensureTessWorker()
-  if (!worker) { console.warn('[OCR] no worker'); return }
-  const fileKey = activeFile.value
-  ocrProgress.value = { current: 0, total: targets.length, status: 'running' }
-  for (const p of targets) {
-    if (p.ocrStatus !== 'pending') continue
-    console.log('[OCR] page', p.pageNum, 'start')
-    try {
-      const pageProxy = await pdfDoc.getPage(p.pageNum)
-      const vp = pageProxy.getViewport({ scale: PDF_SCALE })
-      const tmpCanvas = document.createElement('canvas')
-      tmpCanvas.width = Math.floor(vp.width)
-      tmpCanvas.height = Math.floor(vp.height)
-      const ctx = tmpCanvas.getContext('2d')!
-      await pageProxy.render({ canvasContext: ctx, viewport: vp }).promise
-      const ret = await worker.recognize(tmpCanvas)
-      const words: any[] = ret?.data?.words ?? []
-      console.log('[OCR] page', p.pageNum, 'words=', words.length)
-      // 更新 raw：source 改为 'ocr'，写回 words
-      const idx = pageRaws.value.findIndex(r => r.pageNum === p.pageNum)
-      if (idx >= 0) {
-        pageRaws.value[idx] = { ...p, source: 'ocr', items: words, ocrStatus: 'done' }
-      }
-      if (fileKey && words.length) setCachedOcr(fileKey, p.pageNum, words)
-    } catch (err) {
-      console.warn(`[OCR] page ${p.pageNum} failed:`, err)
-      const idx = pageRaws.value.findIndex(r => r.pageNum === p.pageNum)
-      if (idx >= 0) pageRaws.value[idx] = { ...p, ocrStatus: 'error' }
-    }
-    ocrProgress.value.current++
-    regenerateHtml()
-  }
-  ocrProgress.value.status = 'done'
-  console.log('[OCR] all done')
-}
-
-/** key 规范化：去标点 + 小写 —— 用于 OCR 容错匹配（如 contractTitle vs contract_title ） */
-function normKey(k: string): string {
-  return k.toLowerCase().replace(/[^a-z0-9]/g, '')
-}
-function buildVarLookup() {
-  const byKey = new Map<string, DraftVariable>()
-  const byNorm = new Map<string, DraftVariable>()
-  for (const v of fileVariables.value) {
-    byKey.set(v.key, v)
-    byNorm.set(normKey(v.key), v)
-  }
-  return { byKey, byNorm }
-}
-
-async function releaseTessWorker() {
-  if (tessWorker) {
-    try { await tessWorker.terminate() } catch { /* noop */ }
-    tessWorker = null
-  }
-}
-
-/* ------------------------------------------------------------ HTML 渲染管线
- * pdfPages 是 ref<PdfPageInfo[]>，但内部 html 字段需要根据
- *   - 原始 PDF textItems / OCR words
- *   - 变量列表（保存/确认后变化）
- *   - previewMode（review / final）
- * 实时生成。pageRaws 存原始数据，regenerateHtml() 在变量/mode 变化时重算 html。 */
-interface PageRaw {
-  pageNum: number
-  source: 'pdf' | 'ocr'
-  items: any[]                  // PDF: textContent.items；OCR: tesseract words
-  viewport: { width: number; height: number }
-  ocrStatus: 'pending' | 'done' | 'error' | null
-  imgUrl?: string                // canvas 渲染的整页图片 object URL
-}
-const pageRaws = ref<PageRaw[]>([])
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!))
-}
-
-/** 单个 token 在不同 mode 下的显示文本 */
-function tokenDisplayHtml(v: DraftVariable | null, key: string, previewMode: 'review' | 'final'): string {
-  if (!v) return previewMode === 'final' ? '' : `{{${key}}}`
-  if (v.action === 'delete' || v.action === 'notused') return previewMode === 'final' ? '' : '×'
-  const r = (v.result || v.choice || v.value || '').trim()
-  if (r && (previewMode === 'final' || v.confirmed)) return escapeHtml(r)
-  return `{{${key}}}`
-}
-
-function tokenCssClass(v: DraftVariable | null): string {
-  if (!v) return 'tok-unknown'
-  if (v.action === 'delete' || v.action === 'notused') return 'tok-deleted'
-  if (v.confirmed && (v.result || v.value || v.choice)) return 'tok-ok'
-  if (v.confirmed) return 'tok-ok-empty'
-  return 'tok-warn'
-}
-
-/** PDF.js text items → 变量 overlay HTML。
- *  正文已由 canvas 图片呈现；这里只找 {{KEY}} token，按 PDF 坐标生成绝对定位的 .hit 徽标。
- *  同一行内按 reading order 拼接，并记录每个 item 在拼接串中的偏移，用于反查 token 的 x/宽度。 */
-function textItemsToHtml(
-  items: any[],
-  viewport: { width: number; height: number },
-  byKey: Map<string, DraftVariable>,
-  byNorm: Map<string, DraftVariable>,
-  previewMode: 'review' | 'final'
-): { html: string; hasTokens: boolean } {
-  type Cell = { str: string; x: number; y: number; w: number; h: number }
-  const cells: Cell[] = []
-  for (const it of items) {
-    if (!it.str) continue
-    const t = it.transform
-    cells.push({
-      str: it.str,
-      x: t[4] * PDF_SCALE,
-      y: viewport.height - t[5] * PDF_SCALE,   // baseline 的 CSS y
-      w: (it.width ?? 0) * PDF_SCALE,
-      h: (it.height ?? 0) * PDF_SCALE,
-    })
-  }
-
-  // 按 y 分行（容差 4px）
-  const tolY = 4
-  const lines: Cell[][] = []
-  for (const c of cells) {
-    const last = lines[lines.length - 1]
-    if (last && Math.abs((last[0].y + last[0].h / 2) - (c.y + c.h / 2)) < tolY) {
-      last.push(c)
-    } else {
-      lines.push([c])
-    }
-  }
-  lines.sort((a, b) => a[0].y - b[0].y)
-
-  let html = ''
-  let hasTokens = false
-  for (const line of lines) {
-    const baseline = line[0].y
-    const maxH = Math.max(...line.map((c) => c.h)) || 10
-    const fontSize = maxH * 0.85
-
-    // 拼接行文本，同时记录每个 cell 的 [start, end) 偏移
-    let joined = ''
-    const spans: { start: number; end: number; cell: Cell }[] = []
-    for (const c of line) {
-      if (joined && !joined.endsWith(' ') && !c.str.startsWith(' ')) {
-        joined += ' '
-      }
-      const start = joined.length
-      joined += c.str
-      spans.push({ start, end: joined.length, cell: c })
-    }
-
-    // 偏移 → x 坐标（cell 内按字符数等比插值）
-    const charX = (offset: number): number => {
-      for (const s of spans) {
-        if (offset < s.end || (offset === s.end && s === spans[spans.length - 1])) {
-          const rel = Math.max(0, Math.min(offset - s.start, s.cell.str.length))
-          const ratio = s.cell.str.length ? rel / s.cell.str.length : 0
-          return s.cell.x + s.cell.w * ratio
-        }
-      }
-      return spans.length ? spans[spans.length - 1].cell.x + spans[spans.length - 1].cell.w : 0
-    }
-
-    // 只输出 {{KEY}} token span，普通文字不渲染到 overlay（正文已由 canvas 图片显示）
-    const tokenRe = /\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g
-    let m: RegExpExecArray | null
-    while ((m = tokenRe.exec(joined)) !== null) {
-      const key = m[1]
-      const off = m.index
-      const v = byKey.get(key) ?? byNorm.get(normKey(key)) ?? null
-      hasTokens = true
-      const text = tokenDisplayHtml(v, key, previewMode)
-      const cls = tokenCssClass(v)
-      const left = charX(off)
-      const right = charX(off + m[0].length)
-      const width = Math.max(right - left, fontSize * 0.8)
-      const top = Math.max(0, baseline - maxH * 1.05)
-      // 空文本（删除类变量在 final 模式）→ 用 &nbsp; 撑起白底遮盖原文
-      const inner = text || '&nbsp;'
-      html += `<span class="hit ${cls}" data-hit-var="${escapeHtml(key)}" style="left:${left.toFixed(1)}px;top:${top.toFixed(1)}px;min-width:${width.toFixed(1)}px;font-size:${fontSize.toFixed(1)}px;">${inner}</span>`
-    }
-  }
-
-  return { html, hasTokens }
-}
-
-/** OCR words → HTML 行（与 textItemsToHtml 类似） */
-function ocrWordsToHtml(
-  words: any[],
-  byKey: Map<string, DraftVariable>,
-  byNorm: Map<string, DraftVariable>,
-  previewMode: 'review' | 'final',
-  viewport: { width: number; height: number }
-): { html: string; height: number } {
-  const tolY = 8
-  const lines: any[][] = []
-  for (const w of words) {
-    if (!w.text || !w.bbox) continue
-    const wcy = (w.bbox.y0 + w.bbox.y1) / 2
-    const last = lines[lines.length - 1]
-    if (last) {
-      const lastCy = (last[0].bbox.y0 + last[0].bbox.y1) / 2
-      if (Math.abs(lastCy - wcy) < tolY) {
-        last.push(w)
-        continue
-      }
-    }
-    lines.push([w])
-  }
-  lines.forEach((line) => line.sort((a, b) => a.bbox.x0 - b.bbox.x0))
-  lines.sort((a, b) => a[0].bbox.y0 - b[0].bbox.y0)
-
-  let html = ''
-  let pageMaxBottom = 0
-  for (const line of lines) {
-    const top = Math.min(...line.map((w) => w.bbox.y0))
-    const bottom = Math.max(...line.map((w) => w.bbox.y1))
-    const maxH = bottom - top
-    const fontSize = maxH * 0.85
-    const lineHeight = maxH * 1.3
-
-    let joined = ''
-    let prevEnd: number | null = null
-    for (const w of line) {
-      if (prevEnd !== null) {
-        const gap = w.bbox.x0 - prevEnd
-        if (gap > 4) joined += ' '
-      }
-      joined += w.text
-      prevEnd = w.bbox.x1
-    }
-
-    const lineHtml = joined.replace(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g, (_, key) => {
-      const v = byKey.get(key) ?? byNorm.get(normKey(key)) ?? null
-      const text = tokenDisplayHtml(v, key, previewMode)
-      if (!text) return ''
-      const cls = tokenCssClass(v)
-      return `<span class="hit ${cls}" data-hit-var="${escapeHtml(key)}">${text}</span>`
-    })
-
-    // 绝对定位：OCR bbox 顶（视觉顶部）
-    html += `<div class="doc-line" style="top:${top.toFixed(1)}px;font-size:${fontSize.toFixed(1)}px;line-height:${lineHeight.toFixed(1)}px;">${lineHtml}</div>`
-    pageMaxBottom = Math.max(pageMaxBottom, bottom)
-  }
-
-  return { html, height: Math.max(pageMaxBottom + 20, viewport.height) }
-}
-
-/** 根据 pageRaws + 变量 + previewMode 重算所有页的 overlay html（正文始终是 canvas 图片） */
-function regenerateHtml() {
-  if (!pageRaws.value.length) {
-    pdfPages.value = []
-    return
-  }
-  const varsByKey = buildVarLookup()
-  pdfPages.value = pageRaws.value
-    .slice()
-    .sort((a, b) => a.pageNum - b.pageNum)
-    .map((raw) => {
-      let html = ''
-      let hasTokens = false
-      if (raw.source === 'pdf') {
-        const r = textItemsToHtml(
-          raw.items, raw.viewport, varsByKey.byKey, varsByKey.byNorm, previewMode.value)
-        html = r.html
-        hasTokens = r.hasTokens
-      } else {
-        const r = ocrWordsToHtml(
-          raw.items, varsByKey.byKey, varsByKey.byNorm, previewMode.value, raw.viewport)
-        html = r.html
-      }
-      return {
-        pageNum: raw.pageNum,
-        width: raw.viewport.width,
-        height: raw.viewport.height,
-        imgUrl: raw.imgUrl ?? '',
-        html,
-        ocrStatus: hasTokens ? null : raw.ocrStatus,
-      }
-    })
-}
-
-/** 监听变量和 previewMode 变化 → 重新生成 html（响应式；PDF overlay 与 DOCX 徽标各自重算） */
-watch([variables, previewMode], () => {
-  regenerateHtml()
-  renderDocxHtml()
-}, { deep: true })
-
-watch(
-  [activeFile, projectId, templates],
-  () => {
-    loadPreview()
-  },
-  { immediate: true }
-)
-// 变量列表 / previewMode 变化已在 regenerateHtml() 的 watch 里统一处理
-
-onBeforeUnmount(releaseAllPreview)
-
-/** 审阅调整点：默认列出当前文件未确认的变量；全部确认后回退为列表，便于回归检查 */
-const reviewableVars = computed(() => {
-  const all = fileVariables.value
-  const pending = all.filter((v) => !v.confirmed)
-  return pending.length ? pending : all
-})
-
-/** 当前临时高亮的变量（点击变量行 / 审阅点定位时设置，1.4s 后自动清掉） */
-const flashTokenKey = ref<string | null>(null)
-let flashTimer: number | null = null
-/** 循环定位计数器：同一 key 再次点 → 跳到下一个匹配 */
-let lastLocateKey = ''
-let lastLocateIdx = -1
-
-/**
- * 定位到 PDF 中变量的影响点（DOM-native 版）：
- *  - 用 querySelectorAll 拿所有 [data-hit-var="KEY"] 节点
- *  - 多次出现时同 key 二次点击循环到下一处（opts.cycle）
- *  - 原生 scrollIntoView({block:'center'}) 自动算坐标
- *  - 直接 DOM 操作类名（绕开 vue 响应式开销）
- *  - 左栏变量卡 scrollIntoView（如果不在视野内）
- */
-async function locateTokenInEditor(variableKey: string, opts?: { cycle?: boolean }) {
-  console.log('[locate] start key=', variableKey, 'opts=', opts)
-  selectedDocVarKey.value = variableKey
-  // 左栏变量卡闪烁（响应式，vue 自己处理）
-  if (flashTimer) clearTimeout(flashTimer)
-  flashTokenKey.value = variableKey
-  flashTimer = window.setTimeout(() => {
-    flashTokenKey.value = null
-    flashTimer = null
-  }, 1400)
-
-  await nextTick()
-  const container = pdfScrollContainer.value
-  if (!container) {
-    console.warn('[locate] pdfScrollContainer 为空，PDF 还没渲染?')
-    store.notify(t('drafting.files.noLocatePoint').replace(/@KEY@/g, variableKey), 4200)
-    return
-  }
-
-  // 联动左栏：把对应变量卡滚到视野内
-  const card = document.querySelector<HTMLElement>(`.doc-var-card[data-key="${cssEscapeIdent(variableKey)}"]`)
-  card?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
-
-  // 等 DOM 就绪（OCR 进行中的页面 token 还没渲染）
-  const sel = `.hit[data-hit-var="${cssEscapeIdent(variableKey)}"]`
-  const MAX_MS = 30000, POLL_MS = 400
-  let waitedMs = 0
-  let els: HTMLElement[] = []
-  while (waitedMs <= MAX_MS) {
-    els = Array.from(container.querySelectorAll<HTMLElement>(sel))
-    if (els.length) break
-    const stillRunning = pdfPages.value.some((p) => p.ocrStatus === 'pending') ||
-      ocrProgress.value.status === 'running' || ocrProgress.value.status === 'loading'
-    if (!stillRunning && waitedMs > 1500) break
-    await new Promise((r) => setTimeout(r, POLL_MS))
-    waitedMs += POLL_MS
-    await nextTick()
-  }
-  if (!els.length) {
-    console.warn(`[locate] key=${variableKey} 等了 ${waitedMs}ms 仍未在 PDF 中找到节点。` +
-      `pdfPages=${pdfPages.value.length} 页，pending=${pdfPages.value.filter(p => p.ocrStatus === 'pending').length} 页，ocrStatus=${ocrProgress.value.status}`)
-    store.notify(t('drafting.files.noLocatePoint').replace(/@KEY@/g, variableKey), 4200)
-    return
-  }
-
-  // 计算循环 idx
-  let idx = 0
-  if (opts?.cycle && lastLocateKey === variableKey && els.length > 1) {
-    idx = (lastLocateIdx + 1) % els.length
-  }
-  lastLocateKey = variableKey
-  lastLocateIdx = idx
-
-  // DOM 直接加类：所有匹配 hit-all，当前 hit-current + flash
-  els.forEach((el, k) => {
-    el.classList.add('hit-all')
-    el.classList.toggle('hit-current', k === idx)
-    if (k === idx) {
-      el.classList.add('flash')
-      window.setTimeout(() => el.classList.remove('flash'), 1400)
-    }
+    if (!current(id, token)) return; await refresh(id, token); if (current(id, token)) step.value = 'variables'
   })
-  console.log(`[locate] key=${variableKey} 等了 ${waitedMs}ms，共 ${els.length} 处，定位 #${idx + 1}`)
-
-  // 原生滚动：浏览器自动算坐标
-  els[idx].scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
-
-/** PDF 容器反向联动：点 overlay token → 联动左栏；点值徽标 → 打开就地取值浮层 */
-function onPdfOverlayClick(e: MouseEvent) {
-  const badge = (e.target as HTMLElement | null)?.closest('.hit-value-badge')
-  if (badge) {
-    const bk = badge.getAttribute('data-hit-key')
-    if (bk) {
-      openValueEdit(e, bk)
-      return
-    }
-  }
-  const hit = (e.target as HTMLElement | null)?.closest('[data-hit-var]')
-  if (!hit) return
-  const key = hit.getAttribute('data-hit-var')
-  if (key) void locateTokenInEditor(key, { cycle: true })
-}
-
-// ------------------------------------------------------------ 值徽标 · 就地取值浮层（docx 预览内直接改变量值）
-const valueEdit = ref<{ key: string } | null>(null)
-const valueEditVal = ref('')
-const valueEditPos = ref<{ top: number; left: number } | null>(null)
-const valueEditVar = computed(() =>
-  valueEdit.value ? variables.value.find((v) => v.key === valueEdit.value?.key) ?? null : null
-)
-
-function openValueEdit(e: MouseEvent, key: string) {
-  const v = variables.value.find((x) => x.key === key)
-  if (!v) return
-  valueEditVal.value = (v.result || v.choice || v.value || '').trim()
-  const rect = (e.target as HTMLElement).getBoundingClientRect()
-  valueEditPos.value = {
-    top: rect.bottom + 6,
-    left: Math.max(8, Math.min(rect.left, window.innerWidth - 280)),
-  }
-  valueEdit.value = { key }
-}
-
-async function saveValueEdit() {
-  const ed = valueEdit.value
-  if (!ed) return
-  const v = variables.value.find((x) => x.key === ed.key)
-  if (!v) return
-  const val = valueEditVal.value.trim()
-  if (!val) {
-    valueEdit.value = null
-    return
-  }
-  try {
-    if (v.options.length > 0) await saveVariable(v, { choice: val, confirmed: true })
-    else await saveVariable(v, { value: val, confirmed: true })
-  } catch {
-    /* saveVariable 内部已 toast 错误 */
-  } finally {
-    valueEdit.value = null
-  }
-}
-
-/** CSS.escape polyfill（保证变量 key 中的特殊字符在 querySelector 中安全） */
-function cssEscapeIdent(s: string): string {
-  if (typeof (window as any).CSS?.escape === 'function') return (window as any).CSS.escape(s)
-  return s.replace(/([^\w-])/g, '\\$1')
-}
-
-// ESC 退出专注模式
-function onKeydown(event: KeyboardEvent) {
-  if (event.key === 'Escape') {
-    if (matrixFullscreen.value) matrixFullscreen.value = false
-    else if (focusMode.value) focusMode.value = false
-  }
-}
-
-async function confirmAll(scope: 'BASE' | 'FILE') {
-  const fileKey = scope === 'FILE' ? activeFile.value : undefined
-  confirmingFile.value = true
-  try {
-    variables.value = await draftingApi.confirmAll(projectId.value, scope, fileKey)
-    progress.value = await draftingApi.progress(projectId.value)
-    store.notify(
-      scope === 'FILE'
-        ? t('drafting.files.confirmFileDone').replace('@FILE@', fileKey ?? '')
-        : t('common.confirmAll')
-    )
-  } finally {
-    confirmingFile.value = false
-  }
-}
-
 async function generate() {
-  if (!progress.value?.allReady) {
-    store.notify(t('drafting.gates.needAll'))
+  if (!allTemplates.value || documentDirty.value) return
+  const llmSelection = store.captureLlmSelection()
+  await action(w('generating'), async (id, token) => { await persistDirty(id, token); if (!current(id, token)) return; const sharedPlan = await draftingApi.plan(id); if (!current(id, token)) return; plan.value = sharedPlan; const docs = await draftingApi.generate(id, 'en', llmSelection); if (!current(id, token)) return; documents.value = docs; step.value = 'preview'; documentText.value = docs.find(document => document.fileKey === activeFile.value)?.content ?? ''; documentBaseline.value = documentText.value; bodyDraft.value = createBodyDraft(activeDocument.value); editingDocument.value = false; snapshotDraft(id) })
+}
+async function saveDocument() {
+  if (!documentAccess.value.editable || !documentDirty.value || !activeDocument.value) return
+  const key = activeFile.value
+  await action(w('saving'), async (id, token) => { const patch = bodyPatch(activeDocument.value!, bodyDraft.value); const updated = await draftingApi.updateDocument(id, key, patch); if (!current(id, token)) return; documents.value = documents.value.map(document => document.fileKey === key ? updated : document); documentText.value = updated.content; documentBaseline.value = updated.content; bodyDraft.value = createBodyDraft(updated); editingDocument.value = false; snapshotDraft(id) })
+}
+function editBody(id: string, text: string) { bodyDraft.value.texts[id] = text; snapshotDraft(projectId.value) }
+function insertBody(id: string, lines: string[]) { bodyDraft.value.insertions[id] = lines; snapshotDraft(projectId.value) }
+function chooseBoundFile(key: string) { if (!busy.value && !documentDirty.value && ['NTT', 'SCT', 'SCC'].includes(key)) activeFile.value = key }
+function discardBody() { bodyDraft.value = createBodyDraft(activeDocument.value); documentText.value = activeDocument.value?.content ?? ''; documentBaseline.value = documentText.value; editingDocument.value = false; snapshotDraft(projectId.value) }
+function setImmersive(expanded: boolean) {
+  immersiveDocument.value = expanded
+  documentInfoOpen.value = false
+  nextTick(() => { if (expanded) documentWorkspace.value?.focus({ preventScroll: true }); else immersiveToggle.value?.focus({ preventScroll: true }) })
+}
+function focusableControls(container: HTMLElement) {
+  return [...container.querySelectorAll<HTMLElement>('button, a[href], input, select, textarea, summary, [tabindex]')].filter(control => {
+    const style = window.getComputedStyle(control)
+    return control.tabIndex >= 0 && !control.matches(':disabled, [aria-disabled="true"]') && !control.closest('[hidden], [inert], [aria-hidden="true"]') && style.visibility !== 'hidden' && style.display !== 'none' && control.getClientRects().length > 0
+  })
+}
+function containTab(event: KeyboardEvent, container: HTMLElement) {
+  const controls = focusableControls(container), first = controls[0], last = controls.at(-1), focused = document.activeElement
+  if (!first || !controls.some(control => control === focused)) {
+    event.preventDefault(); ((event.shiftKey ? last : first) ?? container).focus({ preventScroll: true })
+  } else if (event.shiftKey && focused === first || !event.shiftKey && focused === last) {
+    event.preventDefault(); (event.shiftKey ? last : first)?.focus({ preventScroll: true })
+  }
+}
+function workspaceKeydown(event: KeyboardEvent) {
+  if (graphOpen.value || !immersiveDocument.value || event.defaultPrevented) return
+  if (event.target instanceof Element && event.target.closest('.layout-check')) return
+  if (targetId.value) {
+    const dialog = targetModal.value?.$el.querySelector<HTMLElement>('[role="dialog"]')
+    if (event.key === 'Tab' && dialog) containTab(event, dialog)
     return
   }
-  generating.value = true
-  store.setBusy(t('drafting.files.generating'))
-  try {
-    documents.value = await draftingApi.generate(projectId.value, store.locale)
-    progress.value = await draftingApi.progress(projectId.value)
-    store.notify(t('common.done'))
-  } finally {
-    generating.value = false
-    store.clearBusy()
-  }
-}
-
-async function download(fileKey: string) {
-  await draftingApi.download(projectId.value, fileKey, `ConSense_${fileKey}.md`)
-}
-
-/** 下载生成稿 PDF（后端 preview.pdf；未生成时回退标准模板 PDF） */
-async function downloadPdf(fileKey: string) {
-  const doc = documents.value.find((d) => d.fileKey === fileKey && d.generated)
-  const url = doc
-    ? `/drafting/${projectId.value}/documents/${fileKey}/preview.pdf`
-    : `/drafting/${projectId.value}/templates/${fileKey}/preview.pdf`
-  if (!doc) store.notify(t('drafting.files.downloadTemplateHint'))
-  await api.download(url, `ConSense_${fileKey}.pdf`)
-}
-
-async function runTask(busyMessage: string, task: () => Promise<void>) {
-  store.setBusy(busyMessage)
-  try {
-    await task()
-  } finally {
-    store.clearBusy()
-  }
-}
-
-/* ---------------- 变量渲染辅助 ---------------- */
-
-function listRows(variable: DraftVariable): string[][] {
-  try {
-    const parsed = JSON.parse(variable.value || '[]')
-    if (!Array.isArray(parsed)) return []
-    return parsed.map((row) => (Array.isArray(row) ? row.map(String) : [String(row)]))
-  } catch {
-    return []
-  }
-}
-
-function updateListRow(variable: DraftVariable, rowIndex: number, colIndex: number, value: string) {
-  const rows = listRows(variable)
-  if (!rows[rowIndex]) return
-  rows[rowIndex][colIndex] = value
-  variable.value = JSON.stringify(rows)
-}
-
-function listValues(variable: DraftVariable): string[] {
-  try {
-    const parsed = JSON.parse(variable.value || '[]')
-    return Array.isArray(parsed) ? parsed.map((item) => String(item)) : []
-  } catch {
-    return []
-  }
-}
-
-function updateListValue(variable: DraftVariable, index: number, value: string) {
-  const values = listValues(variable)
-  values[index] = value
-  variable.value = JSON.stringify(values)
-}
-
-function removeListValue(variable: DraftVariable, index: number) {
-  const values = listValues(variable)
-  values.splice(index, 1)
-  variable.value = JSON.stringify(values)
-}
-
-function addListValue(variable: DraftVariable) {
-  const values = listValues(variable)
-  values.push('')
-  variable.value = JSON.stringify(values)
-}
-
-function actionTag(action: string | null) {
-  switch (action) {
-    case 'delete':
-      return { label: t('drafting.actions.delete'), cls: 'act-del' }
-    case 'notused':
-      return { label: t('drafting.actions.notused'), cls: 'act-nu' }
-    case 'choice':
-      return { label: t('drafting.actions.choice'), cls: 'act-ch' }
-    case 'rewrite':
-      return { label: t('drafting.actions.rewrite'), cls: 'act-rw' }
-    default:
-      return { label: t('drafting.actions.fill'), cls: 'act-fl' }
-  }
-}
-
-// ------------------------------------------------------------ 第 3 步：分文件确认与预览
-function fileVarsOf(key: string) {
-  return variables.value.filter((item) => item.scope === 'FILE' && item.fileKey === key)
-}
-function fileDoneOf(key: string) {
-  return fileVarsOf(key).filter((item) => item.confirmed).length
-}
-
-/** 变量影响关系矩阵：行 = 变量，列 = NTT / SCT / SCC */
-const matrixRows = computed(() => {
-  const rows: { key: string; label: string; scope: string; action: string; value: string; cells: Record<string, boolean> }[] = []
-  for (const v of variables.value) {
-    const cells: Record<string, boolean> = {}
-    if (v.scope === 'BASE') {
-      const affects = v.affects.length ? v.affects : ['NTT', 'SCT', 'SCC']
-      for (const f of affects) cells[f] = true
-    } else if (v.fileKey) {
-      cells[v.fileKey] = true
+  if (traceOpen.value || previewEditKey.value || removalItem.value) return
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    const pending = documentWorkspace.value?.querySelector<HTMLDetailsElement>('.draft-unresolved[open]')
+    if (documentInfoOpen.value) {
+      documentInfoOpen.value = false
+      nextTick(() => documentInfoToggle.value?.focus({ preventScroll: true }))
+    } else if (pending) {
+      const restoreFocus = pending.contains(document.activeElement)
+      pending.open = false
+      if (restoreFocus) nextTick(() => pending.querySelector<HTMLElement>('summary')?.focus({ preventScroll: true }))
     }
-    if (!Object.keys(cells).length) continue
-    rows.push({
-      key: v.key,
-      label: pick(v.label),
-      scope: v.scope,
-      action: v.action,
-      value: v.value,
-      cells
-    })
-  }
-  return rows
-})
-
-/* ------------------------------------------------------------ 变量影响关系 · 桑基图（FR-D-32） */
-const sankeySearch = ref('')
-const sankeyFileFilter = ref<string | null>(null)   // null = 全部落点
-const sankeySelected = ref<string | null>(null)      // 选中的变量 key
-const matrixFullscreen = ref(false)
-const matrixView = ref<'graph' | 'table'>('graph')
-
-const SANKEY_ACTION_ORDER = ['delete', 'notused', 'choice', 'rewrite', 'fill']
-const SANKEY_FILES = ['NTT', 'SCT', 'SCC']
-
-const sankeyVariables = computed(() => {
-  const query = sankeySearch.value.trim().toLowerCase()
-  return matrixRows.value.filter((row) => {
-    if (sankeyFileFilter.value && !row.cells[sankeyFileFilter.value]) return false
-    if (query && !(row.label.toLowerCase().includes(query) || row.key.toLowerCase().includes(query))) return false
-    return true
-  })
-})
-
-interface SankeyNode {
-  id: string
-  kind: 'var' | 'action' | 'file'
-  label: string
-  sub?: string
-  x: number
-  y: number
-  w: number
-  h: number
-  confirmed?: boolean
-  varKey?: string
-  fileKey?: string
-}
-interface SankeyLink {
-  id: string
-  varKey: string
-  fileKey: string
-  action: string
-  d: string
-}
-
-/** 三列桑基布局：变量 → 改写动作（聚合）→ 文件落点。链路为三次贝塞尔曲线。 */
-const sankeyGeom = computed(() => {
-  const vars = sankeyVariables.value
-  const VAR_H = 24
-  const VAR_GAP = 6
-  const NODE_GAP = 16
-  const PAD = 14
-  const xVar = 12, wVar = 190
-  const xAct = 400, wAct = 128
-  const xFile = 736, wFile = 120
-
-  const nodes: SankeyNode[] = []
-  const varLinks: SankeyLink[] = []
-  const fileLinks: SankeyLink[] = []
-
-  if (!vars.length) {
-    return { nodes, varLinks, fileLinks, width: xFile + wFile + 12, height: 90 }
-  }
-
-  // 1) 变量列
-  const varY = new Map<string, number>()
-  vars.forEach((row, i) => {
-    const y = PAD + i * (VAR_H + VAR_GAP)
-    varY.set(row.key, y)
-    nodes.push({
-      id: `var:${row.key}`,
-      kind: 'var',
-      label: row.label,
-      sub: row.key,
-      x: xVar, y, w: wVar, h: VAR_H,
-      confirmed: variables.value.find((v) => v.key === row.key)?.confirmed,
-      varKey: row.key
-    })
-  })
-  const contentH = vars.length * (VAR_H + VAR_GAP) - VAR_GAP + PAD * 2
-
-  // 2) 动作列（按动作聚合，高度与变量数成正比）
-  const byAction = new Map<string, typeof vars>()
-  for (const row of vars) {
-    const action = SANKEY_ACTION_ORDER.includes(row.action) ? row.action : 'fill'
-    if (!byAction.has(action)) byAction.set(action, [])
-    byAction.get(action)!.push(row)
-  }
-  const actionOrder = SANKEY_ACTION_ORDER.filter((a) => byAction.has(a))
-  const actionY = new Map<string, number>()
-  const actionH = new Map<string, number>()
-  let cursor = PAD
-  for (const action of actionOrder) {
-    const group = byAction.get(action)!
-    const h = Math.max(VAR_H, group.length * VAR_H)
-    actionY.set(action, cursor)
-    actionH.set(action, h)
-    nodes.push({
-      id: `act:${action}`,
-      kind: 'action',
-      label: actionTag(action).label,
-      sub: String(group.length),
-      x: xAct, y: cursor, w: wAct, h
-    })
-    cursor += h + NODE_GAP
-  }
-  const height = Math.max(contentH, cursor - NODE_GAP + PAD)
-
-  // 3) 变量 → 动作链路（动作节点内按变量顺序占槽）
-  for (const row of vars) {
-    const action = SANKEY_ACTION_ORDER.includes(row.action) ? row.action : 'fill'
-    const group = byAction.get(action)!
-    const slot = group.indexOf(row)
-    const y0 = varY.get(row.key)! + VAR_H / 2
-    const slotH = actionH.get(action)! / group.length
-    const y1 = actionY.get(action)! + (slot + 0.5) * slotH
-    const dx = (xAct - (xVar + wVar)) / 2
-    varLinks.push({
-      id: `vl:${row.key}:${action}`,
-      varKey: row.key,
-      fileKey: '',
-      action,
-      d: `M ${xVar + wVar} ${y0} C ${xVar + wVar + dx} ${y0}, ${xAct - dx} ${y1}, ${xAct} ${y1}`
-    })
-  }
-
-  // 4) 文件列 + 动作 → 文件链路
-  const fileCount = new Map<string, number>()
-  for (const row of vars) {
-    for (const f of SANKEY_FILES) if (row.cells[f]) fileCount.set(f, (fileCount.get(f) ?? 0) + 1)
-  }
-  const presentFiles = SANKEY_FILES.filter((f) => fileCount.has(f))
-  const fileY = new Map<string, number>()
-  const fileH = new Map<string, number>()
-  cursor = PAD
-  for (const f of presentFiles) {
-    const h = Math.max(VAR_H, (fileCount.get(f) ?? 0) * VAR_H)
-    fileY.set(f, cursor)
-    fileH.set(f, h)
-    nodes.push({
-      id: `file:${f}`,
-      kind: 'file',
-      label: f,
-      sub: `×${fileCount.get(f)}`,
-      x: xFile, y: cursor, w: wFile, h,
-      fileKey: f
-    })
-    cursor += h + NODE_GAP * 2
-  }
-
-  // 动作 → 文件链路：源槽按动作节点内的变量槽位，目标槽按变量顺序在文件节点内累加
-  const fileSlot = new Map<string, number>()            // file → 已占槽计数
-  for (const row of vars) {
-    const action = SANKEY_ACTION_ORDER.includes(row.action) ? row.action : 'fill'
-    const group = byAction.get(action)!
-    const slot = group.indexOf(row)
-    const slotH = actionH.get(action)! / group.length
-    const y0 = actionY.get(action)! + (slot + 0.5) * slotH
-    for (const f of presentFiles) {
-      if (!row.cells[f]) continue
-      const used = fileSlot.get(f) ?? 0
-      fileSlot.set(f, used + 1)
-      const fh = fileH.get(f)! / (fileCount.get(f) ?? 1)
-      const y1 = fileY.get(f)! + (used + 0.5) * fh
-      const dx = (xFile - (xAct + wAct)) / 2
-      fileLinks.push({
-        id: `fl:${row.key}:${f}`,
-        varKey: row.key,
-        fileKey: f,
-        action,
-        d: `M ${xAct + wAct} ${y0} C ${xAct + wAct + dx} ${y0}, ${xFile - dx} ${y1}, ${xFile} ${y1}`
-      })
-    }
-  }
-
-  return { nodes, varLinks, fileLinks, width: xFile + wFile + 12, height: Math.max(height, cursor - NODE_GAP * 2 + PAD) }
-})
-
-const sankeySelectedVar = computed(() => {
-  const key = sankeySelected.value
-  if (!key) return null
-  return variables.value.find((v) => v.key === key) ?? null
-})
-
-function sankeyLinkClass(link: SankeyLink): string {
-  if (!sankeySelected.value) return ''
-  return link.varKey === sankeySelected.value ? 'on' : 'dim'
-}
-
-function sankeyNodeClass(node: SankeyNode): string[] {
-  const cls: string[] = []
-  if (node.kind === 'var') {
-    if (node.confirmed) cls.push('confirmed')
-    if (sankeySelected.value) cls.push(node.id === `var:${sankeySelected.value}` ? 'on' : 'dim')
-  } else if (node.kind === 'file') {
-    if (sankeyFileFilter.value === node.fileKey) cls.push('on')
-    if (sankeySelected.value) cls.push('dim')
-  } else if (sankeySelected.value) {
-    const selVar = sankeySelectedVar.value
-    const selAction = selVar ? (SANKEY_ACTION_ORDER.includes(selVar.action) ? selVar.action : 'fill') : ''
-    cls.push(node.id === `act:${selAction}` ? 'on' : 'dim')
-  }
-  return cls
-}
-
-function onSankeyVar(key: string) {
-  sankeySelected.value = sankeySelected.value === key ? null : key
-}
-
-function onSankeyFile(fileKey: string) {
-  sankeyFileFilter.value = sankeyFileFilter.value === fileKey ? null : fileKey
-}
-
-function clearSankey() {
-  sankeySelected.value = null
-  sankeySearch.value = ''
-  sankeyFileFilter.value = null
-}
-
-/** 从关系图跳到对应文件的变量卡（并联动 PDF 定位） */
-function gotoVarFile() {
-  const v = sankeySelectedVar.value
-  if (!v) return
-  const target = v.scope === 'FILE' && v.fileKey ? v.fileKey : (v.affects[0] ?? 'NTT')
-  if (draftFileKeys.includes(target)) {
-    sankeySelected.value = null
-    matrixFullscreen.value = false
-    activeFile.value = target
-    selectedDocVarKey.value = v.key
-    void locateTokenInEditor(v.key)
-  }
-}
-
-function truncateSvg(text: string, max = 22): string {
-  return text.length > max ? text.slice(0, max - 1) + '…' : text
-}
-
-/** PDF/DOCX 中识别出的 {{KEY}} 数量 / 命中变量数 / 当前文件变量数（用于头部诊断条） */
-const pdfTokenCount = computed(() => {
-  if (docxHtml.value) {
-    const matches = docxHtml.value.match(/data-hit-var="[^"]+"/g)
-    return matches ? matches.length : 0
-  }
-  let n = 0
-  for (const p of pdfPages.value) {
-    // 用正则统计 .hit[data-hit-var] 节点
-    const matches = p.html.match(/data-hit-var="[^"]+"/g)
-    n += matches ? matches.length : 0
-  }
-  return n
-})
-const pdfMatchedCount = computed(() => {
-  const keys = new Set(variables.value.map((v) => v.key))
-  if (docxHtml.value) {
-    const matches = docxHtml.value.match(/data-hit-var="([^"]+)"/g) ?? []
-    let n = 0
-    for (const m of matches) {
-      const k = m.match(/data-hit-var="([^"]+)"/)![1]
-      if (keys.has(k)) n++
-    }
-    return n
-  }
-  let n = 0
-  for (const p of pdfPages.value) {
-    const matches = p.html.match(/data-hit-var="([^"]+)"/g) ?? []
-    for (const m of matches) {
-      const k = m.match(/data-hit-var="([^"]+)"/)![1]
-      if (keys.has(k)) n++
-    }
-  }
-  return n
-})
-const pdfDiagText = computed(() =>
-  t('drafting.files.pdfDiag')
-    .replace('@TOKENS@', String(pdfTokenCount.value))
-    .replace('@MATCHED@', String(pdfMatchedCount.value))
-    .replace('@VARS@', String(fileVariables.value.length))
-)
-
-function selectDocVar(key: string) {
-  if (selectedDocVarKey.value === key) {
-    selectedDocVarKey.value = null
+    else setImmersive(false)
     return
   }
-  selectedDocVarKey.value = key
-  // 点击左栏变量卡 → 同步触发 PDF 滚动 + overlay 闪烁
-  void locateTokenInEditor(key)
+  if (event.key !== 'Tab' || !documentWorkspace.value) return
+  containTab(event, documentWorkspace.value)
 }
-
-async function saveVarConfirm(variable: DraftVariable) {
-  await saveVariable(variable, { confirmed: !variable.confirmed })
+async function exportDocument(format: 'docx' | 'pdf') { if (canExport.value) await action(w('exporting'), id => draftingApi.exportDocument(id, activeFile.value, format, activeDocument.value?.revisionId)) }
+function move(next: Step) { if (busy.value || documentDirty.value) return; graphNavigation.value = undefined; if (next === 'preview' && !documents.value.some(document => document.generated)) { void generate(); return }; step.value = next }
+function goInput(key: string) {
+  const id = projectId.value, token = generation
+  graphNavigation.value = undefined
+  step.value = 'variables'; search.value = ''; statusFilter.value = 'all'
+  const group = catalog.value.groups.find(item => item.fields.some(field => field.key === key))
+  if (group) focusedGroupId.value = group.id
+  snapshotDraft(id)
+  nextTick(() => {
+    if (!current(id, token) || step.value !== 'variables') return
+    const el = document.getElementById(`field-${key}`)
+    el?.scrollIntoView({ behavior: 'smooth', block: 'center' }); (el?.querySelector('input, select, textarea') as HTMLElement | null)?.focus({ preventScroll: true })
+  })
 }
-
+function openGraph(event: MouseEvent) {
+  if (!projectId.value || busy.value || documentDirty.value || !catalog.value.groups.length) return
+  graphInvoker = event.currentTarget instanceof HTMLElement ? event.currentTarget : undefined
+  graphProject = projectId.value
+  graphOpen.value = true
+}
+function closeGraph(restoreFocus = true) {
+  const invoker = graphInvoker, owner = graphProject
+  graphOpen.value = false; graphInvoker = undefined; graphProject = ''
+  if (restoreFocus) nextTick(() => { if (projectId.value === owner && invoker?.isConnected) invoker.focus({ preventScroll: true }) })
+}
+function graphInput(key: string) {
+  const field = readingFields.value.find(item => item.key === key)
+  if (!graphOpen.value || graphProject !== projectId.value || busy.value || documentDirty.value || !field || applicability(field.condition, values) === 'no') return
+  closeGraph(false)
+  goInput(key)
+}
+function graphLocation(target: GraphLocationTarget) {
+  const field = readingFields.value.find(item => item.key === target.fieldKey)
+  if (!graphOpen.value || graphProject !== projectId.value || busy.value || documentDirty.value || !field || !['NTT', 'SCT', 'SCC'].includes(target.document)) return
+  const registered = target.actionId
+    ? buildBusinessGraph({ catalog: catalog.value, plan: plan.value, values }).actions.some(action => action.id === target.actionId && action.document === target.document && action.clause === target.clause && action.inputKeys.includes(target.fieldKey))
+    : field.affects?.some(location => location.document === target.document && location.clause === target.clause)
+  if (!registered) return
+  closeGraph(false)
+  editingDocument.value = false
+  graphNavigation.value = { sequence: ++graphSequence, projectId: projectId.value, fileKey: target.document, fieldKey: target.fieldKey, actionId: target.actionId, clause: target.clause }
+  activeFile.value = target.document
+  step.value = 'preview'
+  snapshotDraft(projectId.value)
+}
+function openReading(field?: DraftField, target?: DraftPlanAction) {
+  if (documentDirty.value || busy.value) return
+  step.value = 'variables'; readingOpen.value = true
+  if (field) readingKey.value = field.key
+  else if (target) readingKey.value = (target.inputKeys ?? target.fieldKeys ?? []).find(key => readingFields.value.some(item => item.key === key)) ?? ''
+  readingActionId.value = target?.id ?? ''
+  const file = target?.document ?? field?.affects?.[0]?.document
+  if (file && ['NTT', 'SCT', 'SCC'].includes(file)) readingFile.value = file
+  snapshotDraft(projectId.value)
+}
+function selectReading(key: string) {
+  readingKey.value = key; readingActionId.value = ''; goInput(key); snapshotDraft(projectId.value)
+  const id = projectId.value, token = generation
+  nextTick(() => {
+    if (!current(id, token) || !readingOpen.value || readingKey.value !== key || step.value !== 'variables') return
+    const panel = document.getElementById('drafting-template-panel')
+    const card = panel?.querySelector<HTMLElement>('[data-preview-card]')
+    if (!panel || !card) return
+    const header = panel.querySelector<HTMLElement>(':scope > header')
+    const top = panel.scrollTop + card.getBoundingClientRect().top - panel.getBoundingClientRect().top - panel.clientTop - (header?.offsetHeight ?? 0) - 12
+    panel.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+  })
+}
+function changeReadingFile(file: string) { if (['NTT', 'SCT', 'SCC'].includes(file)) { readingFile.value = file; readingActionId.value = ''; snapshotDraft(projectId.value) } }
+function closeReading() { readingOpen.value = false; previewEditKey.value = ''; snapshotDraft(projectId.value) }
+async function goTemplateUpload(fileKey: string) {
+  if (busy.value || documentDirty.value || !['NTT', 'SCT', 'SCC'].includes(fileKey)) return
+  const id = projectId.value, token = generation
+  readingFile.value = fileKey; readingOpen.value = false; previewEditKey.value = ''; step.value = 'inputs'
+  snapshotDraft(id)
+  await nextTick()
+  if (!current(id, token) || step.value !== 'inputs') return
+  document.getElementById(`template-source-${fileKey}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  document.getElementById(`template-upload-button-${fileKey}`)?.focus({ preventScroll: true })
+}
+function chooseTemplate(fileKey: string) {
+  if (busy.value || !['NTT', 'SCT', 'SCC'].includes(fileKey)) return
+  document.getElementById(`template-upload-${fileKey}`)?.click()
+}
+function editReading(key: string) { const field = readingFields.value.find(item => item.key === key); if (field && !busy.value && applicability(field.condition, values) !== 'no') previewEditKey.value = key }
+async function saveReading() {
+  const field = previewEditField.value; if (!field || !dirty(field) || applicability(field.condition, values) === 'no') return
+  await action(w('saving'), async (id, token) => {
+    await persistDirty(id, token, [field]); if (!current(id, token)) return
+    await refresh(id, token); if (current(id, token) && !error.value) previewEditKey.value = ''
+  })
+}
+async function adoptReading() { const field = previewEditField.value; if (field && previewAdoptable(field)) await adopt(field) }
+function readingTarget(id: string) { const item = plan.value?.actions.find(action => action.id === id); if (item) openTarget(item) }
+function locateReadingTarget(id: string) { const item = plan.value?.actions.find(action => action.id === id); if (item) openReading(readingFields.value.find(field => field.key === readingKey.value), item) }
+function overrides(): DraftTargetOverride[] {
+  const raw = variableMap.value.get('targetOverrides')?.value || variableMap.value.get('targetEdits')?.value || variableMap.value.get(targetField.value.key)?.value || ''
+  try { const list = JSON.parse(raw); return Array.isArray(list) ? list.map(item => ({ ...item, value: item.value ?? item.adoptedText })) : [] } catch { return [] }
+}
+function targetActionForIssue(issue: DraftUnresolved) { return actionForUnresolved(issue, plan.value?.actions ?? []) }
+function openTarget(item: DraftPlanAction | DraftUnresolved) {
+  const resolved = 'action' in item ? item : targetActionForIssue(item)
+  if (!resolved) return
+  targetId.value = resolved.id
+  const existing = overrides().find(override => override.actionId === resolved.id)
+  targetAction.value = existing?.action ?? 'amend'; targetText.value = existing?.value ?? ''; targetSourceMapping.value = existing?.sourceMapping ?? ''
+}
+async function saveTarget(remove = false) {
+  const field = targetField.value, id = targetId.value; if (!id || !remove && targetAction.value === 'amend' && !targetText.value.trim()) return
+  const replacement: DraftTargetOverride | undefined = remove ? undefined : { actionId: id, action: targetAction.value, value: targetText.value, sourceMapping: targetSourceMapping.value, document: selectedTarget.value?.document, clause: selectedTarget.value?.clause }
+  const list = replaceTargetOverride(overrides(), id, replacement)
+  await action(w('saving'), async (project, token) => { await saveField(project, token, { ...field, key: 'targetOverrides' }, { value: JSON.stringify(list) }); if (!current(project, token)) return; targetId.value = ''; await refresh(project, token) })
+}
+function beforeUnload(event: BeforeUnloadEvent) {
+  const cachedChanges = [...projectDrafts.values()].some(cached => Object.keys(dirtyPatch(fields.value, cached.values, cached.baseline)).length > 0 || Object.keys(cached.documents ?? {}).length > 0)
+  if (dirtyInputs.value || documentDirty.value || cachedChanges) { event.preventDefault(); event.returnValue = w('unsavedLeave') }
+}
+window.addEventListener('beforeunload', beforeUnload)
+window.addEventListener('keydown', workspaceKeydown)
+watch(targetId, (id, previous) => {
+  if (id && immersiveDocument.value) {
+    const focused = document.activeElement
+    targetInvoker = focused instanceof window.HTMLElement && documentWorkspace.value?.contains(focused) ? focused : undefined
+    targetInvokerProject = projectId.value
+    nextTick(() => {
+      if (!alive || targetId.value !== id || !immersiveDocument.value || projectId.value !== targetInvokerProject) return
+      const dialog = targetModal.value?.$el.querySelector<HTMLElement>('[role="dialog"]')
+      if (dialog) focusableControls(dialog)[0]?.focus({ preventScroll: true })
+    })
+  } else if (!id && previous) {
+    const invoker = targetInvoker, project = targetInvokerProject
+    targetInvoker = undefined; targetInvokerProject = ''
+    nextTick(() => {
+      if (!alive || targetId.value || !immersiveDocument.value || projectId.value !== project) return
+      if (invoker?.isConnected && invoker.getClientRects().length) invoker.focus({ preventScroll: true })
+      else documentWorkspace.value?.focus({ preventScroll: true })
+    })
+  }
+})
+watch(filteredGroups, groups => {
+  if (restoreViewPending || !catalog.value.groups.length) return
+  if (!groups.some(group => group.id === focusedGroupId.value)) { focusedGroupId.value = groups[0]?.id ?? ''; snapshotDraft(projectId.value) }
+})
+watch(values, () => { if (planTimer) clearTimeout(planTimer); planTimer = setTimeout(() => { if (!busy.value) void updatePlan() }, 350) }, { deep: true })
+watch(projectId, (id, old) => {
+  if (old) snapshotDraft(old)
+  closeGraph(false)
+  graphNavigation.value = undefined
+  generation++; planGeneration++; busy.value = ''; error.value = ''; step.value = 'inputs'; activeFile.value = 'NTT'; editingDocument.value = false; immersiveDocument.value = false; targetId.value = ''; restored.value = false; restoreViewPending = true; traceOpen.value = false
+  reviewLayout.value = 'list'; focusedGroupId.value = ''; search.value = ''; statusFilter.value = 'all'
+  catalog.value = { ruleVersion: '', groups: [] }; templates.value = []; inputs.value = []; variables.value = []; documentText.value = ''; documentBaseline.value = ''; documents.value = []; plan.value = null; trace.value = null
+  bodyDraft.value = createBodyDraft(undefined); removalItem.value = null; readingOpen.value = false; readingKey.value = ''; readingActionId.value = ''; readingFile.value = 'NTT'; previewEditKey.value = ''
+  for (const key of Object.keys(values)) delete values[key]; for (const key of Object.keys(baseline)) delete baseline[key]
+  for (const key of Object.keys(inputSaveStates)) delete inputSaveStates[key]
+  if (id) void action(w('loading'), refresh)
+}, { immediate: true })
+watch(activeFile, () => { if (graphNavigation.value?.fileKey !== activeFile.value) graphNavigation.value = undefined; loadDocument(false) })
+watch(activeDocument, () => { loadDocument() })
+watch(step, () => { if (step.value !== 'preview') { immersiveDocument.value = false; graphNavigation.value = undefined } })
+onBeforeUnmount(() => { snapshotDraft(projectId.value); alive = false; generation++; planGeneration++; if (planTimer) clearTimeout(planTimer); window.removeEventListener('beforeunload', beforeUnload); window.removeEventListener('keydown', workspaceKeydown) })
 </script>
 
 <template>
-  <section class="screen">
-    <div class="screen-head">
-      <div>
-        <span class="eyebrow">{{ t('screen.drafting') }}</span>
-        <h3>{{ t('drafting.title') }}</h3>
-        <p>{{ t('drafting.subtitle') }}</p>
-      </div>
-      <div class="row">
-        <span v-if="store.activeProject" class="pill mono">{{ store.activeProject.contractNo }}</span>
-        <button class="btn" type="button" :disabled="loading" @click="reload">
-          <AppIcon name="refresh" :size="15" />{{ t('common.refresh') }}
-        </button>
-      </div>
+  <section class="draft-flow" :class="{ 'with-template': readingOpen && step === 'variables' }">
+    <header class="flow-head"><div><h2>{{ w('title') }}</h2><p>{{ w('subtitle') }}</p></div><div class="row"><button type="button" class="btn" data-open-business-graph="header" :disabled="!projectId || !!busy || documentDirty || !catalog.groups.length" @click="openGraph">{{ w('businessGraph') }}</button><span class="flow-count">{{ adoptedCount }} / {{ actionableFields.length }} {{ w('adopted') }} · {{ unresolvedInputCount }} {{ w('pending') }}</span></div></header>
+    <nav class="flow-steps"><button v-for="item in steps" :key="item.key" type="button" :class="{ active: step === item.key }" :aria-current="step === item.key ? 'step' : undefined" :disabled="!!busy || documentDirty || (item.key === 'preview' && !allTemplates && !documents.some(document => document.generated))" @click="move(item.key)">{{ item.label }}</button></nav>
+    <p v-if="!projectId" class="empty-state">{{ w('selectProject') }}</p><p v-if="busy" class="flow-status" role="status">{{ busy }}</p><p v-if="error" class="flow-error" role="alert">{{ error }}</p><p v-if="restored" class="review-note">{{ w('restoreNote') }}</p>
+    <div v-if="projectId && step === 'inputs'" class="source-stack">
+      <section class="flow-card"><div class="card-head"><h3>{{ w('templates') }}</h3><label class="btn" :class="{ disabled: !!busy }">{{ w('uploadTemplates') }}<input type="file" accept=".doc,.docx,.pdf,.txt,.md" multiple :disabled="!!busy" @change="upload($event, 'templates')" /></label></div><p class="hint">{{ w('templateNote') }}</p><p class="hint">{{ w('editableSource') }}</p><div v-for="key in ['NTT', 'SCT', 'SCC']" :id="`template-source-${key}`" :key="key" class="source-row"><strong>{{ key }}</strong><div><div>{{ templates.find(template => template.key === key)?.fileName || w('notUploaded') }}</div><small>{{ l(templates.find(template => template.key === key)?.status) }} · {{ l(templates.find(template => template.key === key)?.note) }}</small></div><button :id="`template-upload-button-${key}`" type="button" class="btn" :disabled="!!busy" :aria-label="`${key} · ${w('replace')}`" @click="chooseTemplate(key)">{{ w('replace') }}</button><input :id="`template-upload-${key}`" type="file" hidden accept=".doc,.docx,.pdf,.txt,.md" :disabled="!!busy" @change="upload($event, 'templates', key)" /></div></section>
+      <section class="flow-card"><div class="card-head"><h3>{{ w('evidence') }}</h3><label class="btn" :class="{ disabled: !!busy }">{{ w('uploadEvidence') }}<input type="file" accept=".doc,.docx,.pdf,.txt,.md,.eml,.msg" multiple :disabled="!!busy" @change="upload($event, 'inputs')" /></label></div><p class="hint">{{ w('evidenceNote') }}</p><p v-if="!inputs.length" class="hint">{{ w('emptyEvidence') }}</p><div v-for="input in inputs" :key="input.id ?? input.code" class="evidence-row"><div class="card-head"><strong>{{ input.fileName || l(input.title) }}</strong><div class="row"><span>{{ input.status === 'PARSED' ? w('parsedStatus') : ['FAILED', 'PARSE_FAILED'].includes(input.status) ? w('failedStatus') : w('waitingStatus') }}</span><button v-if="input.id !== null && input.id !== undefined" class="btn text-link" :data-remove-input="input.id" :disabled="!!busy" @click="removalItem = input">{{ w('removeCorrespondence') }}</button></div></div><small>{{ l(input.message) }} {{ input.pageCount || '' }}</small></div></section>
+      <footer class="flow-actions"><button v-if="trace" class="btn" @click="traceOpen = true">{{ w('trace') }}</button><button class="btn" :disabled="!!busy || !catalog.groups.length" @click="move('variables')">{{ w('manualEntry') }}</button><button class="btn primary" :disabled="!!busy || !inputs.some(input => input.status === 'PARSED')" @click="extract">{{ w('extract') }}</button></footer>
     </div>
-
-    <div class="surface">
-      <!-- 向导步骤 -->
-      <div class="wizard-steps">
-        <button
-          v-for="(item, index) in steps"
-          :key="item.key"
-          type="button"
-          class="wizard-step"
-          :class="{ active: step === item.key, done: item.done }"
-          @click="gotoStep(item.key as Step)"
-        >
-          <span class="step-index">
-            <AppIcon v-if="item.done" name="check" :size="13" />
-            <template v-else>{{ index + 1 }}</template>
-          </span>
-          <span class="step-copy">
-            <strong>{{ item.title }}</strong>
-            <span>{{ item.desc }}</span>
-          </span>
-        </button>
-      </div>
-
-      <div class="surface-body">
-        <!-- ---------------------------------------- 第 1 步 -->
-        <div v-if="step === 'inputs'" class="wizard-panel">
-          <div class="source-library">
-            <div class="library-block">
-              <div class="library-head">
-                <div>
-                  <strong>{{ t('drafting.templates.title') }}</strong>
-                  <p>{{ t('drafting.templates.desc') }}</p>
-                </div>
-                <div class="row">
-                  <input
-                    ref="templateInput"
-                    type="file"
-                    multiple
-                    accept=".pdf,.doc,.docx,.txt,.md"
-                    class="hidden"
-                    @change="uploadTemplates"
-                  />
-                  <input
-                    ref="templateReplaceInput"
-                    type="file"
-                    accept=".pdf,.doc,.docx,.txt,.md"
-                    class="hidden"
-                    @change="replaceTemplate"
-                  />
-                  <button class="btn" type="button" @click="templateInput?.click()">
-                    <AppIcon name="upload" :size="15" />{{ t('drafting.templates.upload') }}
-                  </button>
-                  <button
-                    v-if="variables.length"
-                    class="btn"
-                    type="button"
-                    :title="t('drafting.templates.blankHint')"
-                    @click="downloadBlankTemplate()"
-                  >
-                    <AppIcon name="download" :size="14" />{{ t('drafting.templates.blank') }}
-                  </button>
-                </div>
-              </div>
-              <div class="template-feed">
-                <div v-for="item in templates" :key="item.key" class="template-item">
-                  <div class="meta">
-                    <strong>{{ pick(item.label) }}</strong>
-                    <div class="template-meta">
-                      <span class="mono">{{ item.fileName }}</span>
-                      <span class="tag" :class="item.tag">{{ pick(item.status) }}</span>
-                    </div>
-                    <div class="template-meta">{{ pick(item.note) }}</div>
-                  </div>
-                  <div class="template-actions">
-                    <button
-                      class="btn"
-                      type="button"
-                      :title="t('drafting.templates.replace') + ' ' + item.key"
-                      @click="startReplaceTemplate(item.key)"
-                    >
-                      <AppIcon name="upload" :size="14" />
-                      {{ t('drafting.templates.replace') }} {{ item.key }}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div class="library-block">
-              <div class="library-head">
-                <div>
-                  <strong>{{ t('drafting.inputs.title') }}</strong>
-                  <p>{{ t('drafting.inputs.desc') }}</p>
-                </div>
-                <div class="row">
-                  <input
-                    ref="evidenceInput"
-                    type="file"
-                    multiple
-                    accept=".pdf,.doc,.docx,.eml,.msg,.txt,.md"
-                    class="hidden"
-                    @change="uploadInputs"
-                  />
-                  <button class="btn" type="button" @click="evidenceInput?.click()">
-                    <AppIcon name="upload" :size="15" />{{ t('drafting.inputs.upload') }}
-                  </button>
-                </div>
-              </div>
-
-              <div v-if="!inputs.length" class="empty-state">{{ t('common.empty') }}</div>
-              <div v-else class="input-feed">
-                <div v-for="item in inputs" :key="item.code" class="input-item">
-                  <div class="meta">
-                    <strong>{{ pick(item.title) }}</strong>
-                    <div class="input-meta">
-                      <span class="tag" :class="item.tag">{{ item.status }}</span>
-                      <span class="tag neutral">
-                        <AppIcon name="file" :size="12" />{{ pick(item.type) }}
-                      </span>
-                      <span v-if="item.ocrUsed" class="tag warn">OCR</span>
-                      <span v-if="item.pageCount">{{ item.pageCount }}p</span>
-                    </div>
-                    <div class="input-meta">{{ pick(item.body) }}</div>
-                  </div>
-                  <div class="input-actions">
-                    <button
-                      class="btn icon-only danger"
-                      type="button"
-                      :title="t('common.delete')"
-                      @click="askDeleteInput(item)"
-                    >
-                      <AppIcon name="trash" :size="15" />
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="wizard-actions">
-            <span class="muted small">{{ t('drafting.variables.extractHint') }}</span>
-            <div class="row">
-              <button class="btn" type="button" :disabled="extracting || !canLeaveInputs" @click="extract">
-                <AppIcon name="wand" :size="15" />
-                {{ extracting ? t('drafting.variables.extracting') : t('drafting.variables.extract') }}
-              </button>
-              <button v-if="trace" class="btn soft" type="button" @click="traceOpen = true">
-                <AppIcon name="info" :size="15" />
-                {{ t('drafting.variables.traceButton') }}
-              </button>
-              <button class="btn primary" type="button" @click="gotoStep('base')">
-                {{ t('common.next') }}<AppIcon name="arrowRight" :size="15" />
-              </button>
-            </div>
-          </div>
-        </div>
-
-        <!-- ---------------------------------------- 第 2 步 -->
-        <div v-else-if="step === 'base'" class="wizard-panel">
-          <div class="surface-head" style="padding: 0 0 12px">
-            <div>
-              <h4>{{ t('drafting.variables.baseTitle') }}</h4>
-              <p>
-                {{ progress?.baseConfirmed ?? 0 }} / {{ progress?.baseTotal ?? 0 }} {{ t('common.confirmed') }}
-              </p>
-            </div>
-            <button class="btn soft" type="button" @click="confirmAll('BASE')">
-              <AppIcon name="check" :size="15" />{{ t('common.confirmAll') }}
-            </button>
-          </div>
-
-          <div v-if="!baseVariables.length" class="empty-state">{{ canLeaveInputs ? t('drafting.variables.emptyReady') : t('drafting.variables.empty') }}</div>
-          <div v-else class="base-var-list">
-            <div v-for="variable in baseVariables" :key="variable.key" class="var-card">
-              <div class="var-card-head">
-                <div
-                  class="title var-locate-title"
-                  :title="t('drafting.files.locateHint')"
-                  @click="locateTokenInEditor(variable.key)"
-                >
-                  <strong><span class="key">{{ variable.key }}</span>{{ pick(variable.label) }}</strong>
-                </div>
-                <div class="tags">
-                  <span class="tag" :class="variable.confirmed ? 'ok' : 'warn'">
-                    {{ variable.confirmed ? t('common.confirmed') : t('common.unconfirmed') }}
-                  </span>
-                  <span v-if="variable.affects.length" class="tag neutral">{{ variable.affects.join(' · ') }}</span>
-                </div>
-              </div>
-
-              <!-- 清单型变量 -->
-              <template v-if="variable.kind === 'list' && variable.cols.length">
-                <div class="table-wrap">
-                  <table class="var-list-table">
-                    <thead>
-                      <tr>
-                        <th v-for="col in variable.cols" :key="col">{{ col }}</th>
-                        <th style="width: 60px" />
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <tr v-for="(row, rowIndex) in listRows(variable)" :key="rowIndex">
-                        <td v-for="(col, colIndex) in variable.cols" :key="col">
-                          <input
-                            :value="row[colIndex] ?? ''"
-                            @change="
-                              updateListRow(variable, rowIndex, colIndex, ($event.target as HTMLInputElement).value);
-                              saveVariable(variable, { value: variable.value, confirmed: true })
-                            "
-                          />
-                        </td>
-                        <td>
-                          <span class="tag ok">{{ t('common.confirmed') }}</span>
-                        </td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              </template>
-
-              <!-- 字符串清单 -->
-              <template v-else-if="variable.kind === 'list'">
-                <div v-for="(value, index) in listValues(variable)" :key="index" class="row" style="margin-bottom: 6px">
-                  <input
-                    style="flex: 1"
-                    :value="value"
-                    @change="
-                      updateListValue(variable, index, ($event.target as HTMLInputElement).value);
-                      saveVariable(variable, { value: variable.value, confirmed: true })
-                    "
-                  />
-                  <button
-                    class="btn icon-only danger"
-                    type="button"
-                    @click="removeListValue(variable, index); saveVariable(variable, { value: variable.value })"
-                  >
-                    <AppIcon name="trash" :size="15" />
-                  </button>
-                </div>
-                <button class="btn" type="button" @click="addListValue(variable); saveVariable(variable, { value: variable.value })">
-                  <AppIcon name="plus" :size="15" />{{ t('common.add') }}
-                </button>
-              </template>
-
-              <!-- 普通取值 -->
-              <div v-else class="var-field">
-                <label>{{ t('drafting.variables.value') }}</label>
-                <div class="row">
-                  <!-- choice 型 → 下拉选择（是/否 等固定选项） -->
-                  <select
-                    v-if="variable.options.length"
-                    class="doc-var-select"
-                    style="flex: 1"
-                    :value="variable.choice || variable.value"
-                    @change="saveVariable(variable, { choice: ($event.target as HTMLSelectElement).value, confirmed: true })"
-                  >
-                    <option v-for="option in variable.options" :key="option.zhHans" :value="option[currentKey]">
-                      {{ pick(option) }}
-                    </option>
-                  </select>
-                  <input
-                    v-else
-                    style="flex: 1"
-                    :value="variable.value"
-                    @change="saveVariable(variable, { value: ($event.target as HTMLInputElement).value, confirmed: true })"
-                  />
-                  <button
-                    class="btn"
-                    :class="{ soft: variable.confirmed }"
-                    type="button"
-                    @click="saveVariable(variable, { confirmed: !variable.confirmed })"
-                  >
-                    <AppIcon name="check" :size="15" />
-                    {{ variable.confirmed ? t('common.confirmed') : t('common.confirm') }}
-                  </button>
-                </div>
-              </div>
-
-              <div v-if="variable.note" class="var-hint">{{ variable.note }}</div>
-              <div v-if="variable.source" class="var-hint">
-                {{ t('drafting.variables.source') }}: {{ variable.source }}
-              </div>
-            </div>
-          </div>
-
-          <div class="wizard-actions">
-            <button class="btn" type="button" @click="gotoStep('inputs')">
-              <AppIcon name="arrowLeft" :size="15" />{{ t('common.back') }}
-            </button>
-            <button class="btn primary" type="button" @click="gotoStep('files')">
-              {{ t('common.next') }}<AppIcon name="arrowRight" :size="15" />
-            </button>
-          </div>
-        </div>
-
-        <!-- ---------------------------------------- 第 3 步 · 分文件确认与预览 -->
-        <div v-else class="wizard-panel file-step">
-          <!-- 文件 tab：NTT / SCT / SCC（含确认计数） + 变量影响关系图 -->
-          <div class="file-tabs main-tabs">
-            <button
-              v-for="key in draftFileKeys"
-              :key="key"
-              type="button"
-              :class="{ active: activeFile === key }"
-              @click="activeFile = key"
-            >
-              {{ key }}
-              <span class="tab-count">{{ fileDoneOf(key) }}/{{ fileVarsOf(key).length }}</span>
-            </button>
-            <button
-              type="button"
-              :class="{ active: activeFile === 'MATRIX' }"
-              @click="activeFile = 'MATRIX'"
-            >
-              <AppIcon name="layers" :size="14" />
-              {{ t('drafting.files.matrix') }}
-            </button>
-          </div>
-
-          <!-- 变量影响关系：桑基图（默认） / 矩阵表格 -->
-          <div v-if="activeFile === 'MATRIX'" class="matrix-wrap" :class="{ fullscreen: matrixFullscreen }">
-            <div class="matrix-toolbar">
-              <input
-                v-model="sankeySearch"
-                type="text"
-                class="matrix-search"
-                :placeholder="t('drafting.files.sankeySearch')"
-              />
-              <div class="mode-switch" role="group">
-                <button
-                  v-for="f in ['NTT', 'SCT', 'SCC']"
-                  :key="f"
-                  type="button"
-                  :class="{ active: sankeyFileFilter === f }"
-                  @click="onSankeyFile(f)"
-                >{{ f }}</button>
-                <button
-                  type="button"
-                  :class="{ active: !sankeyFileFilter }"
-                  @click="sankeyFileFilter = null"
-                >{{ t('common.all') }}</button>
-              </div>
-              <div class="matrix-toolbar-right">
-                <div class="mode-switch" role="group">
-                  <button
-                    type="button"
-                    :class="{ active: matrixView === 'graph' }"
-                    @click="matrixView = 'graph'"
-                  >{{ t('drafting.files.viewGraph') }}</button>
-                  <button
-                    type="button"
-                    :class="{ active: matrixView === 'table' }"
-                    @click="matrixView = 'table'"
-                  >{{ t('drafting.files.viewTable') }}</button>
-                </div>
-                <button class="btn" type="button" @click="clearSankey">
-                  <AppIcon name="x" :size="14" />{{ t('drafting.files.sankeyClear') }}
-                </button>
-                <button class="btn" type="button" @click="matrixFullscreen = !matrixFullscreen">
-                  <AppIcon :name="matrixFullscreen ? 'fullscreenExit' : 'fullscreen'" :size="14" />
-                  {{ matrixFullscreen ? t('drafting.files.exitFocus') : t('drafting.files.sankeyFullscreen') }}
-                </button>
-              </div>
-            </div>
-
-            <!-- 图形视图：变量 → 改写动作 → 文件落点 三列桑基 -->
-            <div v-if="matrixView === 'graph'" class="sankey-wrap">
-              <div v-if="!sankeyVariables.length" class="empty-state">
-                {{ t('drafting.files.sankeyEmpty') }}
-              </div>
-              <svg
-                v-else
-                class="sankey-svg"
-                :viewBox="`0 0 ${sankeyGeom.width} ${sankeyGeom.height}`"
-                preserveAspectRatio="xMidYMin meet"
-              >
-                <!-- 链路 -->
-                <path
-                  v-for="link in sankeyGeom.varLinks"
-                  :key="link.id"
-                  class="sankey-link"
-                  :class="sankeyLinkClass(link)"
-                  :d="link.d"
-                />
-                <path
-                  v-for="link in sankeyGeom.fileLinks"
-                  :key="link.id"
-                  class="sankey-link file"
-                  :class="sankeyLinkClass(link)"
-                  :d="link.d"
-                />
-                <!-- 节点 -->
-                <g
-                  v-for="node in sankeyGeom.nodes"
-                  :key="node.id"
-                  class="sankey-node"
-                  :class="sankeyNodeClass(node)"
-                  :transform="`translate(${node.x}, ${node.y})`"
-                  @click="node.kind === 'var' ? onSankeyVar(node.varKey!) : node.kind === 'file' ? onSankeyFile(node.fileKey!) : undefined"
-                >
-                  <rect :width="node.w" :height="node.h" rx="5" />
-                  <text class="node-label" :x="9" :y="node.h / 2 - 2">
-                    {{ node.kind === 'var' ? (node.confirmed ? '✓ ' : '· ') + truncateSvg(node.label) : node.label }}
-                  </text>
-                  <text v-if="node.sub && node.kind !== 'var'" class="node-sub" :x="9" :y="node.h / 2 + 11">
-                    {{ node.sub }}
-                  </text>
-                  <text v-if="node.kind === 'var'" class="node-sub" :x="9" :y="node.h / 2 + 10">
-                    {{ node.sub }}
-                  </text>
-                </g>
-              </svg>
-
-              <!-- 列标题 + 图例 -->
-              <div class="sankey-cols" v-if="sankeyVariables.length">
-                <span>{{ t('drafting.files.sankeyVars') }}</span>
-                <span>{{ t('drafting.files.sankeyActions') }}</span>
-                <span>{{ t('drafting.files.sankeyFiles') }}</span>
-              </div>
-
-              <!-- 选中变量详情 -->
-              <div v-if="sankeySelectedVar" class="sankey-detail">
-                <div class="sankey-detail-head">
-                  <strong>{{ pick(sankeySelectedVar.label) }}</strong>
-                  <span class="act-badge" :class="actionTag(sankeySelectedVar.action).cls">
-                    {{ actionTag(sankeySelectedVar.action).label }}
-                  </span>
-                  <span class="tag" :class="sankeySelectedVar.confirmed ? 'ok' : 'warn'">
-                    {{ sankeySelectedVar.confirmed ? t('common.confirmed') : t('common.unconfirmed') }}
-                  </span>
-                  <button class="btn primary" type="button" @click="gotoVarFile">
-                    <AppIcon name="arrowRight" :size="14" />{{ t('drafting.files.sankeyGotoFile') }}
-                  </button>
-                </div>
-                <div class="sankey-detail-body">
-                  <div><b>{{ t('drafting.files.impactPoint') }}</b><span>{{ sankeySelectedVar.affects.join(' / ') || '—' }}</span></div>
-                  <div><b>{{ t('drafting.files.valueLabel') }}</b><span>{{ sankeySelectedVar.result || sankeySelectedVar.choice || sankeySelectedVar.value || '—' }}</span></div>
-                  <div v-if="sankeySelectedVar.note"><b>{{ t('drafting.files.sourceLabel') }}</b><span>{{ sankeySelectedVar.note }}</span></div>
-                </div>
-              </div>
-
-              <div class="matrix-legend">
-                <span>{{ t('drafting.files.sankeyLegend') }}</span>
-              </div>
-            </div>
-
-            <!-- 表格视图（原有矩阵） -->
-            <div v-else class="matrix-table">
-              <table>
-                <thead>
-                  <tr>
-                    <th style="min-width: 200px">{{ t('drafting.variables.fileTitle') }}</th>
-                    <th v-for="key in draftFileKeys" :key="key">{{ key }}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="row in matrixRows" :key="row.key">
-                    <td>
-                      <strong>{{ row.label }}</strong>
-                      <span class="act-badge" :class="actionTag(row.action).cls">{{ actionTag(row.action).label }}</span>
-                    </td>
-                    <td
-                      v-for="key in draftFileKeys"
-                      :key="key"
-                      :class="{ 'cell-empty': !row.cells[key] }"
-                    >
-                      <template v-if="row.cells[key]">
-                        <span class="cell-anchor">{{ row.key }}</span>
-                        <div class="cell-result">{{ row.value || '—' }}</div>
-                      </template>
-                      <template v-else>—</template>
-                    </td>
-                  </tr>
-                  <tr v-if="!matrixRows.length">
-                    <td :colspan="draftFileKeys.length + 1" class="cell-empty">
-                      {{ t('drafting.variables.empty') }}
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-              <div class="matrix-legend">
-                <span>{{ t('drafting.files.matrixHint') }}</span>
-              </div>
-            </div>
-          </div>
-
-          <!-- 左右双栏：左 · 变量确认清单 / 右 · 文稿工作台 -->
-          <div v-else class="doc-split" :class="{ 'is-focus': focusMode }">
-            <!-- 左栏：变量确认 -->
-            <div class="doc-pane">
-              <div class="doc-pane-head">
-                <strong>{{ activeFile }} {{ t('drafting.files.varChecklist') }}</strong>
-                <div class="pane-head-actions">
-                  <span class="tag" :class="fileVariables.length && fileDoneOf(activeFile) === fileVariables.length ? 'ok' : 'warn'">
-                    {{ fileDoneOf(activeFile) }}/{{ fileVariables.length }}
-                  </span>
-                  <button
-                    class="btn soft"
-                    type="button"
-                    :disabled="confirmingFile || !fileVariables.length"
-                    @click="confirmAll('FILE')"
-                  >
-                    <AppIcon name="check" :size="14" />
-                    {{ t('drafting.files.confirmFileAll') }}
-                  </button>
-                  <button class="btn" type="button" @click="focusMode = !focusMode">
-                    <AppIcon :name="focusMode ? 'fullscreenExit' : 'fullscreen'" :size="14" />
-                    {{ focusMode ? t('drafting.files.exitFocus') : t('drafting.files.focusMode') }}
-                  </button>
-                </div>
-              </div>
-              <div class="var-scroll">
-                <!-- 影响当前文件的基础变量（第 2 步已确认，这里作为定位入口，只读） -->
-                <template v-for="variable in fileBaseVars" :key="'base-' + variable.key">
-                  <div
-                    :data-key="variable.key"
-                    class="doc-var-card doc-var-card--base"
-                    :class="{ selected: selectedDocVarKey === variable.key, flash: flashTokenKey === variable.key }"
-                    @click="selectDocVar(variable.key)"
-                  >
-                    <div class="doc-var-title">
-                      <div class="doc-var-title-main">
-                        <span class="base-badge">基础</span>
-                        <strong>{{ pick(variable.label) }}</strong>
-                        <span class="act-badge" :class="actionTag(variable.action).cls">
-                          {{ actionTag(variable.action).label }}
-                        </span>
-                      </div>
-                    </div>
-                    <div class="doc-var-line">
-                      <b>{{ t('drafting.files.impactPoint') }}</b>
-                      <span class="rp-anchor">{{ variable.source || t('drafting.files.noAnchor') }}</span>
-                    </div>
-                  </div>
-                </template>
-                <div
-                  v-for="variable in fileVariables"
-                  :key="variable.key"
-                  :data-key="variable.key"
-                  class="doc-var-card"
-                  :class="{
-                    confirmed: variable.confirmed,
-                    selected: selectedDocVarKey === variable.key,
-                    flash: flashTokenKey === variable.key
-                  }"
-                  @click="selectDocVar(variable.key)"
-                >
-                  <div class="doc-var-title">
-                    <div class="doc-var-title-main">
-                      <strong>{{ pick(variable.label) }}</strong>
-                      <span class="act-badge" :class="actionTag(variable.action).cls">
-                        {{ actionTag(variable.action).label }}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div class="doc-var-line">
-                    <b>{{ t('drafting.files.impactPoint') }}</b>
-                    <span class="rp-anchor">{{ variable.source || t('drafting.files.noAnchor') }}</span>
-                    <span v-if="variable.affects.length > 1" class="tag info">
-                      {{ t('drafting.files.sharedWith') }}
-                      {{ variable.affects.filter((a) => a !== variable.fileKey).join(' / ') }}
-                    </span>
-                  </div>
-
-                  <div v-if="variable.note" class="doc-var-line">
-                    <b>{{ t('drafting.files.sourceLabel') }}</b>
-                    <span>{{ variable.note }}</span>
-                  </div>
-
-                  <!-- 取值控件：choice → 下拉；rewrite → AI 建议稿；fill → 输入框 -->
-                  <template v-if="variable.options.length">
-                    <div class="doc-var-line">
-                      <b>{{ t('drafting.files.valueLabel') }}</b>
-                    </div>
-                    <select
-                      class="doc-var-select"
-                      :value="variable.choice || variable.value"
-                      @click.stop
-                      @change="saveVariable(variable, { choice: ($event.target as HTMLSelectElement).value, confirmed: true })"
-                    >
-                      <option v-for="option in variable.options" :key="option.zhHans" :value="option[currentKey]">
-                        {{ pick(option) }}
-                      </option>
-                    </select>
-                  </template>
-                  <template v-else-if="variable.action === 'rewrite'">
-                    <div class="doc-var-line">
-                      <b>{{ t('drafting.files.aiDraft') }}</b>
-                    </div>
-                    <textarea
-                      rows="3"
-                      :value="variable.value"
-                      @click.stop
-                      @change="saveVariable(variable, { value: ($event.target as HTMLTextAreaElement).value, confirmed: true })"
-                    />
-                  </template>
-                  <template v-else>
-                    <div class="doc-var-line">
-                      <b>{{ t('drafting.files.valueLabel') }}</b>
-                    </div>
-                    <input
-                      type="text"
-                      :value="variable.value"
-                      @click.stop
-                      @change="saveVariable(variable, { value: ($event.target as HTMLInputElement).value, confirmed: true })"
-                    />
-                  </template>
-
-                  <div class="doc-var-line">
-                    <b>{{ t('drafting.files.resultLabel') }}</b>
-                  </div>
-                  <div class="doc-var-result">{{ variable.result || '—' }}</div>
-
-                  <div class="doc-var-actions">
-                    <span class="tag" :class="variable.confirmed ? 'ok' : 'warn'">
-                      {{ variable.confirmed ? t('common.confirmed') : t('common.unconfirmed') }}
-                    </span>
-                    <button
-                      class="btn"
-                      :class="{ primary: !variable.confirmed }"
-                      type="button"
-                      @click.stop="saveVarConfirm(variable)"
-                    >
-                      <AppIcon name="check" :size="14" />
-                      {{ variable.confirmed ? t('drafting.files.reedit') : t('common.confirm') }}
-                    </button>
-                  </div>
-                </div>
-
-                <div v-if="!fileVariables.length" class="rp-empty">
-                  {{ canLeaveInputs ? t('drafting.variables.emptyReady') : t('drafting.variables.empty') }}
-                </div>
-              </div>
-            </div>
-
-            <!-- 右栏：标准模板预览（docx 经 mammoth 渲染 / PDF 走 PDF.js canvas）+ 审阅调整点抽屉 -->
-            <div class="doc-pane">
-              <div class="doc-pane-head">
-                <strong>{{ activeFile }} · {{ t('drafting.files.headerTitle') }}</strong>
-                <span v-if="pdfPages.length" class="pdf-diag">
-                  {{ pdfDiagText }}
-                </span>
-                <span v-if="ocrProgress.status === 'loading'" class="pdf-ocr">
-                  {{ t('drafting.files.ocrLoading') }}
-                </span>
-                <span v-else-if="ocrProgress.status === 'running'" class="pdf-ocr">
-                  {{ t('drafting.files.ocrRunning').replace('@CURRENT@', String(ocrProgress.current)).replace('@TOTAL@', String(ocrProgress.total)) }}
-                </span>
-                <span v-else-if="ocrProgress.status === 'error'" class="pdf-ocr err">
-                  {{ t('drafting.files.ocrError') }}
-                </span>
-                <div class="pane-head-actions">
-                  <div class="mode-switch" role="group" :aria-label="t('drafting.files.previewMode')">
-                    <button
-                      type="button"
-                      :class="{ active: previewMode === 'review' }"
-                      @click="previewMode = 'review'"
-                    >{{ t('drafting.files.modeReview') }}</button>
-                    <button
-                      type="button"
-                      :class="{ active: previewMode === 'final' }"
-                      @click="previewMode = 'final'"
-                    >{{ t('drafting.files.modeFinal') }}</button>
-                  </div>
-                  <button
-                    class="btn review-toggle"
-                    :class="{ on: reviewPaneOpen }"
-                    type="button"
-                    :title="t('drafting.files.reviewToggleHint')"
-                    @click="reviewPaneOpen = !reviewPaneOpen"
-                  >
-                    <AppIcon name="info" :size="14" />
-                    {{ t('drafting.files.reviewToggle') }} ({{ fileVariables.length }})
-                  </button>
-                  <button class="btn" type="button" @click="download(activeFile)">
-                    <AppIcon name="download" :size="14" />
-                    {{ t('drafting.files.download') }} {{ activeFile }}
-                  </button>
-                  <button class="btn" type="button" :title="t('drafting.files.downloadPdfHint')" @click="downloadPdf(activeFile)">
-                    <AppIcon name="download" :size="14" />
-                    PDF
-                  </button>
-                </div>
-              </div>
-              <div class="doc-edit-wrap">
-                <div class="doc-edit-pane">
-                  <!-- PDF 铺满右栏：PDF.js canvas 多页 + overlay 替换变量；doc 与 preview 视图完全一致 -->
-                  <div class="de-body">
-                    <div class="de-preview-full">
-                      <!-- DOCX 模板：mammoth HTML 流式预览，{{KEY}} 徽标与 PDF 同构，点击变量联动滚动 -->
-                      <div v-if="docxHtml" class="pdf-scroll docx-scroll" ref="pdfScrollContainer">
-                        <div class="docx-page" v-html="docxHtml" @click="onPdfOverlayClick"></div>
-                      </div>
-                      <div v-else-if="pdfLoading" class="dt-loading">{{ t('common.loading') }}</div>
-                      <div v-else-if="pdfError" class="dt-loading">{{ pdfError }}</div>
-                      <div v-else-if="!pdfPages.length" class="dt-loading">{{ t('drafting.files.previewFailed') }}</div>
-                      <!-- PDF 模板：PDF.js canvas 多页 + overlay 替换变量 -->
-                      <div v-else class="pdf-scroll" ref="pdfScrollContainer">
-                        <div
-                          v-for="(page, idx) in pdfPages"
-                          :key="`page-${activeFile}-${page.pageNum}`"
-                          class="pdf-page-wrap"
-                          :data-page="page.pageNum"
-                          :style="{ width: page.width + 'px', height: page.height + 'px' }"
-                        >
-                          <!-- 底层：PDF.js 渲染的真实页面图片（所见即所得，扫描件同样适用） -->
-                          <img
-                            v-if="page.imgUrl"
-                            class="pdf-canvas-img"
-                            :src="page.imgUrl"
-                            :width="page.width"
-                            :height="page.height"
-                            alt=""
-                            draggable="false"
-                          />
-                          <!-- 顶层：变量 overlay（只含 token 徽标，透明背景不挡正文） -->
-                          <div
-                            class="doc-page"
-                            :class="{ final: previewMode === 'final' }"
-                            @click="onPdfOverlayClick"
-                            v-html="page.html"
-                          ></div>
-                        </div>
-                      </div>
-                      <!-- 就地取值浮层：点击预览内值徽标后出现，选择后直接保存到变量并回写文件（独立于上方 v-if 链） -->
-                      <div
-                        v-if="valueEdit && valueEditPos"
-                        class="value-edit-pop"
-                        :style="{ top: valueEditPos.top + 'px', left: valueEditPos.left + 'px' }"
-                        @click.stop
-                      >
-                        <div class="value-edit-head">
-                          <strong>{{ valueEditVar ? pick(valueEditVar.label) : valueEdit.key }}</strong>
-                          <span v-if="valueEditVar" class="act-badge" :class="valueEditVar ? actionTag(valueEditVar.action).cls : ''">
-                            {{ valueEditVar ? actionTag(valueEditVar.action).label : '' }}
-                          </span>
-                        </div>
-                        <select v-if="valueEditVar && valueEditVar.options.length" v-model="valueEditVal" class="value-edit-select">
-                          <option v-for="o in valueEditVar.options" :key="pick(o)" :value="pick(o)">{{ pick(o) }}</option>
-                        </select>
-                        <input v-else v-model="valueEditVal" class="value-edit-input" placeholder="输入取值…" />
-                        <div class="value-edit-actions">
-                          <button class="btn soft" type="button" @click="valueEdit = null">{{ t('common.cancel') }}</button>
-                          <button class="btn" type="button" @click="saveValueEdit">{{ t('common.save') }}</button>
-                        </div>
-                      </div>
-                    </div>
-                    <!-- 审阅调整点抽屉（覆盖在 PDF 之上） -->
-                    <transition name="slide-right">
-                      <aside v-if="reviewPaneOpen" class="de-review-drawer">
-                        <div class="de-review-head">
-                          <strong>{{ t('drafting.files.reviewPaneTitle') }}</strong>
-                          <button class="btn icon-only" type="button" @click="reviewPaneOpen = false">
-                            <AppIcon name="x" :size="14" />
-                          </button>
-                        </div>
-                        <div class="de-review-hint">{{ t('drafting.files.reviewPaneHint') }}</div>
-                        <div class="de-review-list">
-                          <div
-                            v-for="v in reviewableVars"
-                            :key="v.key"
-                            class="rp-item"
-                            :class="{ selected: selectedDocVarKey === v.key, flash: flashTokenKey === v.key }"
-                            @click="locateTokenInEditor(v.key)"
-                          >
-                            <div class="rp-item-head">
-                              <strong>{{ pick(v.label) }}</strong>
-                              <span class="act-badge" :class="actionTag(v.action).cls">{{ actionTag(v.action).label }}</span>
-                            </div>
-                            <div v-if="v.source" class="rp-anchor">{{ v.source }}</div>
-                            <div v-if="v.confirmed && (v.value || v.choice || v.result)" class="rp-result">
-                              → {{ v.result || v.choice || v.value }}
-                            </div>
-                          </div>
-                          <div v-if="!reviewableVars.length" class="rp-empty">{{ t('drafting.files.noPoints') }}</div>
-                        </div>
-                      </aside>
-                    </transition>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="wizard-actions">
-            <button class="btn" type="button" @click="gotoStep('base')">
-              <AppIcon name="arrowLeft" :size="15" />{{ t('common.back') }}
-            </button>
-            <div class="row">
-              <span class="muted small">
-                {{ progress?.allReady ? t('drafting.wizard.files.done') : t('drafting.gates.needAll') }}
-              </span>
-              <button class="btn success" type="button" :disabled="generating || !progress?.allReady" @click="generate">
-                <AppIcon name="play" :size="15" />
-                {{ generating ? t('drafting.files.generating') : t('drafting.files.generate') }}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
+    <div v-if="projectId && step === 'variables'" class="input-stack">
+      <div class="input-intro"><p>{{ w('reviewIntro') }}</p><div class="row"><button class="btn" :disabled="!!busy" @click="openReading()">{{ w('templateReading') }}</button><button class="btn" :disabled="!!busy || !inputs.some(input => input.status === 'PARSED')" @click="extract">{{ w('extract') }}</button><button v-if="trace" class="btn" @click="traceOpen = true">{{ w('trace') }}</button></div></div>
+      <div class="question-tools"><input v-model="search" :placeholder="w('search')" :aria-label="w('search')" /><select v-model="statusFilter" :aria-label="w('all')"><option value="all">{{ w('all') }}</option><option v-for="status in ['missing', 'suggested', 'adopted', 'manual', 'needs_review', 'conflict', 'inactive'] as DraftWord[]" :key="status" :value="status">{{ w(status) }}</option></select><button class="btn" @click="search = ''; statusFilter = 'all'">{{ w('clearFilters') }}</button></div>
+      <div class="review-layout-switch" role="group" :aria-label="w('reviewLayout')"><button class="btn" :class="{ primary: reviewLayout === 'list' }" :aria-pressed="reviewLayout === 'list'" @click="changeReviewLayout('list')">{{ w('listLayout') }}</button><button class="btn" :class="{ primary: reviewLayout === 'focus' }" :aria-pressed="reviewLayout === 'focus'" @click="changeReviewLayout('focus')">{{ w('focusLayout') }}</button></div>
+      <p v-if="!filteredGroups.length" class="empty-state">{{ w('noMatches') }}</p>
+      <div class="question-review" :class="{ focus: reviewLayout === 'focus' }">
+      <nav v-if="reviewLayout === 'focus' && filteredGroups.length" class="question-index" :aria-label="w('questionIndex')"><button v-for="group in filteredGroups" :key="group.id" class="question-index-item" :aria-current="focusedGroup?.id === group.id ? 'step' : undefined" :data-review-group="group.id" @click="chooseGroup(group.id)"><span class="group-number">{{ groupNumber(group) }}</span><span>{{ l(group.label) }}<small class="state" :class="groupState(group)">{{ w(groupState(group)) }}</small></span></button></nav>
+      <div class="question-editor">
+      <div v-if="reviewLayout === 'focus' && filteredGroups.length" class="question-navigation"><button class="btn" :disabled="focusedGroupIndex <= 0" @click="moveQuestion(-1)">{{ w('previousQuestion') }}</button><span aria-live="polite">{{ w('questionPosition') }} {{ focusedGroupIndex + 1 }} / {{ filteredGroups.length }}</span><button class="btn" :disabled="focusedGroupIndex >= filteredGroups.length - 1" @click="moveQuestion(1)">{{ w('nextQuestion') }}</button></div>
+      <section v-for="group in displayedGroups" :id="`group-${group.id}`" :key="group.id" class="flow-card input-group" :data-group="group.id">
+        <div class="card-head"><h3><span class="group-number">{{ groupNumber(group) }}</span>{{ l(group.label) }}</h3><span class="state" :class="groupState(group)">{{ w(groupState(group)) }}</span></div><p v-if="group.description" class="hint">{{ l(group.description) }}</p>
+        <article v-for="field in visibleFields(group)" :id="`field-${field.key}`" :key="field.key" class="variable" :class="{ 'source-selected': readingOpen && readingKey === field.key }" :data-variable="field.key"><div class="variable-head"><button class="btn text-link" :data-open-template="field.key" :disabled="!!busy" @click="openReading(field)">{{ w('locateTemplate') }}</button><span class="state" :class="state(field)">{{ dirty(field) ? w('unsaved') : w(state(field)) }}</span><button v-if="variableMap.get(field.key)?.reviewRequired" class="btn soft" :disabled="!!busy" @click="adopt(field)">{{ w('reviewed') }}</button><button v-else-if="state(field) === 'suggested'" class="btn soft" :disabled="!!busy" @click="adopt(field)">{{ w('adoptSuggested') }}</button></div><DraftingInputField :field="field" :value="values[field.key]" :values="values" :locale="store.locale" :trace="trace" :disabled="inputDisabled(field)" @update="update(field, $event)"><template #actions><div class="field-save-actions"><button type="button" class="btn primary" :data-save-input="field.key" :disabled="!!busy || !dirty(field) || applicability(field.condition, values) === 'no'" @click="saveInput(field)">{{ w('saveInput') }}</button><span v-if="inputSaveStatus(field)" class="field-save-feedback" :class="{ failed: inputSaveStates[field.key] === 'failed' }" :data-input-save-status="field.key" role="status" aria-live="polite">{{ w(inputSaveStatus(field)!) }}</span></div></template></DraftingInputField><p v-if="derivedInput(field)" class="hint">{{ w('durationDerived') }}</p><p v-if="['contractPeriodMonths', 'periodAtLeast39Months'].includes(field.key) && durationConflict" class="condition-note">{{ w('durationConflict') }}</p><p v-if="applicability(field.condition, values) === 'unknown'" class="condition-note">{{ w('prerequisite') }}</p><p v-if="validationIssue(field, values[field.key]) && validationIssue(field, values[field.key]) !== 'missing'" class="condition-note">{{ w(validationIssue(field, values[field.key])!) }}</p><p v-if="['siteInspectionStartDate', 'siteInspectionEndDate'].includes(field.key) && reversedSiteDates(values)" class="condition-note">{{ w('reversedDates') }}</p><p v-if="variableMap.get(field.key)?.validationIssue" class="condition-note">{{ variableMap.get(field.key)?.validationIssue }}</p><details class="field-evidence"><summary>{{ w('sourceDetails') }}</summary><blockquote v-if="variableMap.get(field.key)?.source">{{ variableMap.get(field.key)?.source }}</blockquote><p v-else class="hint">{{ w('noSource') }}</p><p v-if="variableMap.get(field.key)?.note" class="hint raw-text">{{ variableMap.get(field.key)?.note }}</p><div v-for="(candidate, candidateIndex) in variableMap.get(field.key)?.candidates ?? []" :key="candidateIndex" class="candidate"><strong>{{ candidate.fileName || w('candidates') }}</strong><DraftingValueDisplay :field="field" :value="candidate.value" :locale="store.locale" /><blockquote>{{ candidate.sourceQuote }}</blockquote><p class="hint raw-text">{{ candidate.reason }}</p><button class="btn" :disabled="!!busy" @click="adopt(field, candidateIndex)">{{ w('adoptCandidate') }}</button></div><p v-for="target in field.affects ?? []" :key="`${target.document}-${target.clause}`" class="hint">{{ target.document }} {{ target.clause }} · {{ target.paragraphs }}</p></details></article>
+        <DraftingBillDistribution v-if="group.id === 'bills'" :values="values" :locale="store.locale" /><p v-if="visibleFields(group).length !== group.fields.length" class="hint">{{ w('hiddenFields') }}</p><details v-if="relatedActions(group).length" class="clause-details"><summary>{{ w('affected') }}</summary><div v-for="item in relatedActions(group)" :key="item.id" class="clause-action" :data-action-id="item.id"><div class="card-head"><strong>{{ item.document }} {{ item.clause }}</strong><span class="state">{{ w((item.action in { retain: 1, amend: 1, delete: 1, not_used: 1, pending: 1, not_adopted: 1 } ? item.action : 'pending') as DraftWord) }}</span></div><p class="hint">{{ item.paragraphs }}</p><p>{{ l(item.detail) }}</p><details v-if="item.sourceWarning" class="source-warning"><summary>{{ w('sourceWarning') }}</summary><p class="condition-note">{{ l(item.sourceWarning) }}</p></details><pre v-if="item.value">{{ item.value }}</pre><button class="btn text-link" :disabled="!!busy" @click="openReading(undefined, item)">{{ w('locateTemplate') }}</button><button class="btn text-link" :disabled="!!busy" @click="openTarget(item)">{{ w('exactEdit') }}</button></div></details><footer v-if="group.fields.some(dirty)" class="flow-actions"><button class="btn" :disabled="!!busy" @click="discard(group)">{{ w('discard') }}</button><button class="btn primary" :disabled="!!busy" @click="saveGroup(group)">{{ w('save') }}</button></footer>
+      </section>
+      </div></div>
+      <footer class="flow-actions"><button class="btn" :disabled="!!busy" @click="move('inputs')">{{ w('backSources') }}</button><button class="btn" :disabled="!!busy || !dirtyInputs" @click="saveGroup()">{{ w('saveAll') }}</button><button class="btn primary" :disabled="!!busy || !allTemplates" @click="generate">{{ w('generate') }}</button></footer><p class="hint">{{ w('generateNote') }}</p><p v-if="!allTemplates" class="condition-note">{{ w('missingTemplates') }}</p>
+      <details v-if="plan?.unresolved.length" class="flow-card"><summary>{{ w('unresolved') }} ({{ plan.unresolved.length }})</summary><DraftingUnresolvedItems :items="plan.unresolved" :fields="fields" :values="values" :actions="plan.actions" :locale="store.locale" @input="goInput" @target="openTarget" /></details>
     </div>
-
-    <!-- 删除沟通证据确认 -->
-    <AppModal :open="deleteEvidenceOpen" :title="t('drafting.inputs.deleteTitle')" @close="deleteEvidenceOpen = false">
-      <p>
-        {{
-          t('drafting.inputs.deleteConfirm').replace(
-            '@NAME@',
-            pick(deleteEvidenceTarget?.title) || deleteEvidenceTarget?.fileName || ''
-          )
-        }}
-      </p>
-      <template #footer>
-        <button class="btn" type="button" @click="deleteEvidenceOpen = false">{{ t('common.cancel') }}</button>
-        <button class="btn danger" type="button" @click="confirmDeleteInput">{{ t('common.delete') }}</button>
-      </template>
-    </AppModal>
-
-    <!-- 模型识别过程：提示词 + 模型原始返回（含每个变量的依据 sourceQuote 与思路 reason） -->
-    <AppModal :open="traceOpen" :title="t('drafting.variables.traceTitle')" wide @close="traceOpen = false">
-      <div v-if="trace" class="trace">
-        <div class="trace-meta">
-          <span>{{ t('drafting.variables.traceModel') }}：{{ trace.model }}</span>
-          <span>{{ t('drafting.variables.traceAt') }}：{{ formatTraceTime(trace.finishedAt) }}</span>
-        </div>
-
-        <details class="trace-block" open>
-          <summary>{{ t('drafting.variables.traceSystem') }}</summary>
-          <pre>{{ trace.systemPrompt }}</pre>
-        </details>
-
-        <details class="trace-block">
-          <summary>{{ t('drafting.variables.traceUser') }}</summary>
-          <pre>{{ trace.userPrompt }}</pre>
-        </details>
-
-        <details class="trace-block" open>
-          <summary>{{ t('drafting.variables.traceRaw') }}</summary>
-          <pre v-for="(raw, index) in trace.rawResponses" :key="index">{{ raw }}</pre>
-        </details>
+    <section v-if="projectId && step === 'preview'" ref="documentWorkspace" class="flow-card preview-card" :class="{ 'preview-card--immersive': immersiveDocument }" data-document-workspace :role="immersiveDocument ? 'dialog' : undefined" :aria-modal="immersiveDocument ? true : undefined" :aria-label="w('documentWorkspace')" tabindex="-1">
+      <div class="card-head">
+        <div class="document-tabs"><button v-for="key in ['NTT', 'SCT', 'SCC']" :key="key" class="btn" :class="{ primary: activeFile === key }" :disabled="!!busy || documentDirty" @click="activeFile = key">{{ key }}</button></div>
+        <div class="document-tools"><button class="btn" :disabled="!!busy || !documentAccess.editable || documentDirty" @click="editingDocument = !editingDocument">{{ editingDocument && !activeDocument?.stale ? w('readDocument') : w('editContent') }}</button><template v-if="documentDirty"><button class="btn" :disabled="!!busy" @click="discardBody">{{ w('discard') }}</button><button class="btn primary" :disabled="!!busy || !documentAccess.editable" @click="saveDocument">{{ w('saveContent') }}</button></template><button v-if="activeDocument?.stale" class="btn primary" :disabled="!!busy || !allTemplates || documentDirty" @click="generate">{{ w('regenerate') }}</button><button v-if="immersiveDocument" ref="documentInfoToggle" type="button" class="btn" :aria-expanded="documentInfoOpen" aria-controls="draft-document-info" @click="documentInfoOpen = !documentInfoOpen">{{ w('documentInformation') }}</button></div>
+        <div class="row"><button v-if="immersiveDocument" type="button" class="btn" data-open-business-graph="immersive" :disabled="!!busy || documentDirty || !catalog.groups.length" @click="openGraph">{{ w('businessGraph') }}</button><button class="btn" :disabled="!!busy || !canExport" @click="exportDocument('docx')">{{ w('exportWord') }}</button><button class="btn primary" :disabled="!!busy || !canExport" @click="exportDocument('pdf')">{{ w('exportPdf') }}</button><button ref="immersiveToggle" type="button" class="btn" :aria-expanded="immersiveDocument" @click="setImmersive(!immersiveDocument)">{{ immersiveDocument ? w('exitImmersive') : w('immersivePreview') }}</button></div>
       </div>
-      <div v-else class="empty-state">{{ t('drafting.variables.traceEmpty') }}</div>
+      <div v-show="!immersiveDocument || documentInfoOpen" class="document-info" id="draft-document-info">
+      <h3>{{ activeDocument?.title }}</h3>
+      <p v-if="activeDocument?.revisionId" class="document-revision-status" role="status"><span>{{ w('savedBodyRevision') }}: {{ activeDocument.revisionId }}</span><strong v-if="documentDirty">{{ w('pendingBodyRevision') }}</strong></p>
+      <details v-if="activeDocument?.revisionId" class="document-versions"><summary>{{ w('documentVersions') }}</summary><p v-if="activeDocument.snapshotId">{{ w('snapshot') }}: {{ activeDocument.snapshotId }}</p><p>Revision: {{ activeDocument.revisionId }}</p><p>DOCX SHA-256: {{ activeDocument.docxSha256 }}</p><p v-if="activeDocument.pdfSha256">PDF SHA-256: {{ activeDocument.pdfSha256 }}</p><p v-if="activeDocument.renderProfileHash">Render profile: {{ activeDocument.renderProfileHash }}</p></details>
+      <p v-if="activeDocument?.generated" class="condition-note">{{ w('formatReview') }}</p>
+      </div>
+      <p v-if="documentDirty" class="condition-note">{{ w('pendingBodyNote') }}</p>
+      <p v-if="activeDocument?.stale || dirtyInputs" class="review-note">{{ w('stale') }}</p><p v-if="activeDocument?.stale" class="condition-note">{{ w('staleReadOnly') }}</p>
+      <p v-if="immersiveDocument && busy" class="flow-status" role="status">{{ busy }}</p><p v-if="immersiveDocument && error" class="flow-error" role="alert">{{ error }}</p>
+      <div class="document-surface">
+      <DraftingDocumentWorkspace :project-id="projectId" :file-key="activeFile" :document="activeDocument" :dirty="documentDirty" :editing="editingDocument" :locale="store.locale" :immersive="immersiveDocument" :fields="readingFields" :values="values" :variables="variables" :actions="plan?.actions ?? []" :field-states="readingStates" :dirty-keys="readingDirtyKeys" :trace="trace" :graph-navigation="graphNavigation" :disabled="!!busy" @input="goInput" @file="chooseBoundFile">
+        <DraftingBodyEditor v-if="activeDocument?.blocks" :blocks="activeDocument.blocks" :draft="bodyDraft" :locale="store.locale" :readonly="!documentAccess.editable" :disabled="!!busy" :immersive="immersiveDocument" @text="editBody" @insert="insertBody" />
+        <pre v-else class="raw-text">{{ documentText }}</pre>
+      </DraftingDocumentWorkspace>
+      </div>
+      <details v-if="currentUnresolved.length" class="draft-unresolved" :open="!immersiveDocument"><summary>{{ w('unresolved') }} ({{ currentUnresolved.length }})</summary><DraftingUnresolvedItems :items="currentUnresolved" :fields="fields" :values="values" :actions="plan?.actions ?? []" :locale="store.locale" @input="goInput" @target="openTarget" /></details>
+      <footer class="flow-actions"><button class="btn" :disabled="!!busy || documentDirty" @click="move('variables')">{{ w('backInputs') }}</button><p v-if="immersiveDocument" class="hint regeneration-warning">{{ w('regenerationNote') }}</p><button class="btn" :disabled="!!busy || !allTemplates || documentDirty" @click="generate">{{ w('regenerate') }}</button></footer><p v-if="!immersiveDocument" class="hint">{{ w('regenerationNote') }}</p>
+    </section>
+    <footer v-if="catalog.ruleVersion" class="hint">{{ w('ruleVersion') }}: {{ catalog.ruleVersion }}</footer>
+    <aside v-if="projectId && step === 'variables' && readingOpen" id="drafting-template-panel" class="template-side-panel" data-template-panel :aria-label="w('templateReading')">
+      <header class="card-head"><h3>{{ w('templateReading') }}</h3><button class="btn" @click="closeReading">{{ w('close') }}</button></header>
+      <DraftingTemplatePreview :project-id="projectId" :file-key="readingFile" :source-available="readingSourceAvailable" :locale="store.locale" :fields="readingFields" :values="values" :variables="variables" :actions="plan?.actions ?? []" :selected-key="readingKey" :selected-action-id="readingActionId" :field-states="readingStates" :dirty-keys="readingDirtyKeys" :disabled="!!busy" @select="selectReading" @edit="editReading" @input="selectReading" @target="readingTarget" @locate="locateReadingTarget" @file="changeReadingFile" @upload="goTemplateUpload" />
+    </aside>
+    <DraftingBusinessGraph v-if="graphOpen" :project-id="projectId" :catalog="catalog" :plan="plan" :values="values" :variables="variables" :field-states="readingStates" :dirty-keys="readingDirtyKeys" :locale="store.locale" :disabled="!!busy || documentDirty" @input="graphInput" @location="graphLocation" @close="closeGraph()" />
+    <AppModal :open="!!previewEditField" :title="w('editPreviewValue')" @close="previewEditKey = ''">
+      <template v-if="previewEditField"><span class="state">{{ dirty(previewEditField) ? w('unsavedValue') : w(state(previewEditField)) }}</span><p class="hint">{{ w('previewEditNote') }}</p><DraftingInputField :field="previewEditField" :value="values[previewEditField.key]" :values="values" :locale="store.locale" id-prefix="preview-edit" :disabled="inputDisabled(previewEditField)" @update="update(previewEditField, $event)" /><p v-if="derivedInput(previewEditField)" class="hint">{{ w('durationDerived') }}</p><p v-if="error" class="flow-error" role="alert">{{ error }}</p><div class="flow-actions"><button class="btn" :disabled="!!busy" @click="previewEditKey = ''">{{ w('close') }}</button><button v-if="previewAdoptable(previewEditField)" class="btn" :disabled="!!busy" @click="adoptReading">{{ w('adoptSuggested') }}</button><button class="btn primary" :data-preview-save="previewEditField.key" :disabled="!!busy || !dirty(previewEditField) || applicability(previewEditField.condition, values) === 'no'" @click="saveReading">{{ w('save') }}</button></div></template>
     </AppModal>
-
-    
+    <AppModal :open="traceOpen" :title="w('trace')" wide @close="traceOpen = false"><DraftingExtractionReport :trace="trace" :project-id="projectId" :locale="store.locale" :open="traceOpen" /></AppModal>
+    <AppModal :open="!!removalItem" :title="w('removeCorrespondence')" @close="removalItem = null">
+      <template v-if="removalItem"><strong>{{ removalItem.fileName || l(removalItem.title) }}</strong><p class="condition-note">{{ w('removeCorrespondenceNote') }}</p><p v-if="error" class="flow-error" role="alert">{{ error }}</p><div class="flow-actions"><button class="btn" :disabled="!!busy" @click="removalItem = null">{{ w('close') }}</button><button class="btn primary" :disabled="!!busy" @click="removeCorrespondence">{{ w('removeFromProject') }}</button></div></template>
+    </AppModal>
+    <AppModal ref="targetModal" :open="!!targetId" :title="w('exactEdit')" wide @close="targetId = ''"><template v-if="selectedTarget"><p v-if="busy" class="flow-status" role="status">{{ busy }}</p><p v-if="error" class="flow-error" role="alert">{{ error }}</p><strong>{{ selectedTarget.document }} {{ selectedTarget.clause }}</strong><p class="hint">{{ selectedTarget.paragraphs }}</p><p>{{ l(selectedTarget.detail) }}</p><p v-if="selectedTarget.sourceWarning" class="condition-note"><strong>{{ w('sourceWarning') }}</strong><br />{{ l(selectedTarget.sourceWarning) }}</p><details v-if="selectedTarget.sourceText" class="source-target"><summary>{{ w('sourceTarget') }}</summary><pre lang="en">{{ selectedTarget.sourceText }}</pre></details><p class="condition-note">{{ w('targetNote') }}</p><label>{{ w('targetAction') }}<select v-model="targetAction" :disabled="!!busy"><option v-for="item in ['retain', 'amend', 'delete', 'not_used'] as const" :key="item" :value="item">{{ w(item) }}</option></select></label><label v-if="targetAction === 'amend'">{{ w('targetText') }}<textarea v-model="targetText" rows="8" :disabled="!!busy" /></label><label>{{ w('sourceMapping') }}<textarea v-model="targetSourceMapping" rows="3" :disabled="!!busy" /></label><p class="hint">{{ w('sourceMappingNote') }}</p><div class="flow-actions"><button class="btn" :disabled="!!busy" @click="saveTarget(true)">{{ w('targetReset') }}</button><button class="btn primary" :disabled="!!busy || (targetAction === 'amend' && !targetText.trim())" @click="saveTarget()">{{ w('targetSave') }}</button></div></template></AppModal>
   </section>
 </template>
 
-<style>
-.trace {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.trace-meta {
-  display: flex;
-  gap: 18px;
-  flex-wrap: wrap;
-  font-size: 12px;
-  color: var(--muted, #888);
-}
-
-.trace-block {
-  border: 1px solid var(--border, #e2e2e2);
-  border-radius: 8px;
-  overflow: hidden;
-}
-
-.trace-block summary {
-  cursor: pointer;
-  padding: 8px 12px;
-  font-weight: 600;
-  font-size: 13px;
-  background: rgba(127, 127, 127, 0.06);
-  user-select: none;
-}
-
-.trace-block pre {
-  margin: 0;
-  padding: 10px 12px;
-  max-height: 320px;
-  overflow: auto;
-  font-size: 12px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-/* 编辑正文弹窗 */
-.doc-edit-area {
-  width: 100%;
-  min-height: 420px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 12.5px;
-  line-height: 1.6;
-  padding: 12px 14px;
-  border: 1px solid var(--border, #d6d8de);
-  border-radius: 6px;
-  background: #fff;
-  color: inherit;
-  resize: vertical;
-  box-sizing: border-box;
-}
-.hint {
-  margin: 0 0 8px;
-  font-size: 12px;
-  color: var(--muted, #888);
-}
-
-/* ---------- 第 3 步 · 分文件确认与预览（对齐原型 doc-split 工作台） ---------- */
-.file-step {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-/* 文件 tab 条（原型 .file-tabs）：下边线式 tab */
-.main-tabs {
-  display: flex;
-  gap: 6px;
-  border-bottom: 1px solid var(--border, #e2e2e2);
-  margin-bottom: 4px;
-  flex-wrap: nowrap;
-  overflow-x: auto;
-}
-.main-tabs button {
-  border: 0;
-  background: transparent;
-  cursor: pointer;
-  font: inherit;
-  font-weight: 700;
-  font-size: 13px;
-  color: var(--muted, #888);
-  padding: 9px 14px;
-  border-bottom: 2px solid transparent;
-  flex: 0 0 auto;
-  white-space: nowrap;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.main-tabs button:hover {
-  color: var(--text, #333);
-}
-.main-tabs button.active {
-  color: var(--primary, #2563eb);
-  border-bottom-color: var(--primary, #2563eb);
-}
-.main-tabs .tab-count {
-  font-weight: 400;
-  color: var(--muted, #888);
-  font-size: 12px;
-}
-
-/* 左右双栏（原型 .doc-split）：左 变量确认清单（加宽）+ 右 编辑器（顶 tab 切文本 / PDF）；双栏撑满视口 */
-.doc-split {
-  display: grid;
-  grid-template-columns: 360px minmax(0, 1fr);
-  grid-template-rows: minmax(760px, calc(100vh - 230px));
-  gap: 16px;
-  align-items: stretch;
-}
-.doc-split > .doc-pane:first-child {
-  height: 0;
-  min-height: 100%;
-}
-.doc-pane {
-  border: 1px solid var(--border, #e2e2e2);
-  border-radius: 10px;
-  background: var(--surface, #fff);
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  overflow: hidden;
-}
-.doc-pane-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border, #e2e2e2);
-  background: rgba(127, 127, 127, 0.04);
-  flex-wrap: wrap;
-}
-.doc-pane-head strong {
-  font-size: 15px;
-}
-.pdf-diag {
-  font-size: 12px;
-  color: var(--muted, #6b7280);
-  padding: 4px 10px;
-  border: 1px dashed currentColor;
-  border-radius: 4px;
-  background: rgba(0, 0, 0, 0.03);
-}
-.pdf-ocr {
-  font-size: 12px;
-  padding: 4px 10px;
-  border-radius: 4px;
-  background: rgba(37, 99, 235, 0.1);
-  color: #1d4ed8;
-  border: 1px solid rgba(37, 99, 235, 0.35);
-  animation: ocrPulse 1.6s ease-in-out infinite;
-}
-.pdf-ocr.err {
-  background: rgba(217, 83, 79, 0.1);
-  color: #b91c1c;
-  border-color: rgba(217, 83, 79, 0.35);
-  animation: none;
-}
-@keyframes ocrPulse {
-  0%, 100% { opacity: 0.6; }
-  50% { opacity: 1; }
-}
-.pane-head-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-/* 左栏变量卡列表（原型 .var-scroll / .doc-var-card，已放大） */
-.var-scroll {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow: auto;
-  padding: 14px;
-  display: grid;
-  gap: 12px;
-  align-content: start;
-}
-.doc-var-card {
-  border: 1px solid var(--border, #e2e2e2);
-  border-radius: 10px;
-  padding: 14px 16px;
-  display: grid;
-  gap: 10px;
-  background: #fff;
-  cursor: pointer;
-}
-.doc-var-card.confirmed {
-  border-color: #9fe1cb;
-  background: #f4fbf8;
-}
-/* 基础变量定位入口卡（第 3 步左栏，只读） */
-.doc-var-card--base {
-  border-color: #dbeafe;
-  background: #f8faff;
-  padding: 10px 14px;
-  gap: 6px;
-}
-.doc-var-card--base .doc-var-title strong {
-  font-size: 13.5px;
-}
-.doc-var-card--base .doc-var-line {
-  font-size: 12px;
-}
-.base-badge {
-  font-size: 10.5px;
-  font-weight: 700;
-  color: #1d4ed8;
-  background: #dbeafe;
-  border-radius: 4px;
-  padding: 1px 6px;
-  margin-right: 2px;
-}
-.doc-var-card.selected {
-  outline: 2px solid var(--primary, #2563eb);
-}
-.doc-var-card.flash {
-  animation: varCardFlash 1.4s ease-out;
-}
-@keyframes varCardFlash {
-  0%   { box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.35); }
-  60%  { box-shadow: 0 0 0 10px rgba(37, 99, 235, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0); }
-}
-.doc-var-title {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
-  justify-content: space-between;
-}
-.doc-var-title strong {
-  font-size: 15px;
-  line-height: 1.45;
-}
-.doc-var-line {
-  font-size: 13px;
-  color: var(--muted, #888);
-  display: flex;
-  gap: 7px;
-  flex-wrap: wrap;
-  align-items: center;
-}
-.doc-var-line b {
-  color: var(--text, #555);
-  font-weight: 500;
-  flex: 0 0 auto;
-}
-.doc-var-select,
-.doc-var-card input,
-.doc-var-card textarea {
-  width: 100%;
-  border: 1px solid var(--border, #d6d8de);
-  border-radius: 6px;
-  padding: 8px 10px;
-  font: inherit;
-  font-size: 13.5px;
-  background: #fff;
-  color: inherit;
-  box-sizing: border-box;
-}
-.doc-var-card textarea {
-  resize: vertical;
-}
-.doc-var-result {
-  font-size: 13px;
-  color: var(--text, #555);
-  line-height: 1.6;
-}
-.doc-var-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-/* 处理方式徽标（原型 .act-badge 五色，已放大） */
-.act-badge {
-  display: inline-block;
-  font-size: 12px;
-  font-weight: 700;
-  border-radius: 5px;
-  padding: 3px 9px;
-  border: 1px solid transparent;
-  white-space: nowrap;
-}
-.act-del { color: #a32d2d; background: #fcebeb; border-color: #f7c1c1; }
-.act-nu { color: #854f0b; background: #faeeda; border-color: #fac775; }
-.act-ch { color: #185fa5; background: #e6f1fb; border-color: #b5d4f4; }
-.act-rw { color: #534ab7; background: #eeedfe; border-color: #cecbf6; }
-.act-fl { color: #0f6e56; background: #e1f5ee; border-color: #9fe1cb; }
-
-.tag.info {
-  background: rgba(37, 99, 235, 0.08);
-  color: var(--primary, #2563eb);
-}
-.tag.ok {
-  background: rgba(16, 185, 129, 0.1);
-  color: #0f6e56;
-}
-.tag.warn {
-  background: rgba(245, 158, 11, 0.12);
-  color: #854f0b;
-}
-
-/* 右栏模式切换（原型 .mode-switch） */
-.mode-switch {
-  display: inline-flex;
-  border: 1px solid var(--border, #d6d8de);
-  border-radius: 7px;
-  overflow: hidden;
-}
-.mode-switch button {
-  border: 0;
-  background: #fff;
-  cursor: pointer;
-  font: inherit;
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--muted, #888);
-  padding: 6px 12px;
-}
-.mode-switch button + button {
-  border-left: 1px solid var(--border, #d6d8de);
-}
-.mode-switch button.active {
-  background: rgba(37, 99, 235, 0.08);
-  color: var(--primary, #2563eb);
-}
-
-/* 预览源切换：文稿 / 标准模板（与 mode-switch 同款） */
-.source-switch {
-  display: inline-flex;
-  border: 1px solid var(--border, #d6d8de);
-  border-radius: 7px;
-  overflow: hidden;
-}
-.source-switch button {
-  border: 0;
-  background: #fff;
-  cursor: pointer;
-  font: inherit;
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--muted, #888);
-  padding: 6px 12px;
-}
-.source-switch button + button {
-  border-left: 1px solid var(--border, #d6d8de);
-}
-.source-switch button.active {
-  background: rgba(37, 99, 235, 0.08);
-  color: var(--primary, #2563eb);
-}
-
-/* doc-edit-wrap：右栏编辑器外壳（撑满右栏高度） */
-.doc-edit-wrap {
-  display: flex;
-  flex-direction: column;
-  flex: 1 1 auto;
-  min-height: 0;
-  min-width: 0;
-  padding: 12px;
-}
-.doc-edit-pane {
-  flex: 1 1 auto;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  background: #fff;
-  border: 1px solid var(--border, #e2e2e2);
-  border-radius: 10px;
-  overflow: hidden;
-}
-
-.de-body {
-  flex: 1 1 auto;
-  min-height: 0;
-  position: relative;
-  /* flex 链不能在这里断掉：de-preview-full/pdf-scroll 的 flex:1 依赖父级是 flex 容器，
-     否则高度随内容撑开、滚动失效 */
-  display: flex;
-  flex-direction: column;
-}
-
-/* doc view = PDF 铺满整右栏（与原 preview tab 等大；文本编辑器 / 顶部 tab 已删除） */
-.de-preview-full {
-  position: relative;
-  flex: 1 1 auto;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  background: #fff;
-}
-.dt-loading { padding: 20px; color: var(--muted, #888); }
-
-/* 文档预览：每页是流式 HTML 渲染（PDF.js textContent → 行 + hit span） */
-.pdf-scroll {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow: auto;
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 18px;
-  background: #eef0f3;
-}
-/* ---------- DOCX 模板预览（mammoth HTML 流式布局） ---------- */
-.docx-scroll {
-  display: block;
-  padding: 24px;
-  gap: 0;
-}
-.docx-page {
-  background: #fff;
-  max-width: 920px;
-  margin: 0 auto;
-  padding: 28px 44px 48px;
-  box-shadow: 0 1px 8px rgba(0, 0, 0, 0.12);
-  border-radius: 4px;
-  font-size: 14px;
-  line-height: 1.75;
-  color: #1f2937;
-  word-break: break-word;
-}
-.docx-page h1, .docx-page h2, .docx-page h3, .docx-page h4 {
-  margin: 20px 0 8px;
-  line-height: 1.35;
-  font-weight: 600;
-  color: #111827;
-}
-.docx-page p { margin: 8px 0; }
-.docx-page table { border-collapse: collapse; width: 100%; margin: 12px 0; }
-.docx-page th, .docx-page td { border: 1px solid #d1d5db; padding: 6px 10px; text-align: left; vertical-align: top; }
-.docx-page th { background: #f3f4f6; font-weight: 600; }
-.docx-page ul, .docx-page ol { margin: 8px 0; padding-left: 24px; }
-.docx-page li { margin: 3px 0; }
-.docx-page img { max-width: 100%; }
-/* docx 内联徽标：覆盖 PDF overlay 的绝对定位，改成流式 inline 徽标，联动高亮类复用 */
-.docx-page .hit {
-  position: static;
-  display: inline-block;
-  border-radius: 3px;
-  padding: 0 3px;
-  margin: 0 1px;
-  font-size: inherit;
-  line-height: 1.25;
-}
-.docx-page .hit.tok-ok { background: rgba(22, 163, 74, 0.14); border: 1px solid rgba(22, 163, 74, 0.5); color: #065f46; }
-.docx-page .hit.tok-ok-empty { background: rgba(148, 163, 184, 0.16); border: 1px dashed #94a3b8; color: #475569; }
-.docx-page .hit.tok-warn { background: rgba(245, 158, 11, 0.16); border: 1px solid rgba(245, 158, 11, 0.55); color: #92400e; }
-.docx-page .hit.tok-unknown { background: rgba(239, 68, 68, 0.10); border: 1px dashed #f87171; color: #991b1b; }
-.docx-page .hit.tok-deleted { background: #fff; border: 1px solid #e5e7eb; color: #9ca3af; }
-/* 值徽标：模板无占位符时锚点旁的取值入口 */
-.hit-value-badge {
-  display: inline-block;
-  margin-left: 6px;
-  font-size: 11.5px;
-  font-weight: 700;
-  color: #1d4ed8;
-  background: #dbeafe;
-  border: 1px solid #bfdbfe;
-  border-radius: 4px;
-  padding: 1px 8px;
-  cursor: pointer;
-  user-select: none;
-  vertical-align: baseline;
-}
-.hit-value-badge:hover {
-  background: #bfdbfe;
-}
-/* 就地取值浮层 */
-.value-edit-pop {
-  position: fixed;
-  z-index: 1200;
-  width: 260px;
-  background: #fff;
-  border: 1px solid #d1d5db;
-  border-radius: 10px;
-  box-shadow: 0 8px 30px rgba(15, 23, 42, 0.18);
-  padding: 12px;
-  display: grid;
-  gap: 10px;
-}
-.value-edit-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-.value-edit-head strong { font-size: 13.5px; }
-.value-edit-select,
-.value-edit-input {
-  width: 100%;
-  border: 1px solid #d1d5db;
-  border-radius: 6px;
-  padding: 6px 8px;
-  font-size: 13px;
-  background: #fff;
-}
-.value-edit-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-}
-/* 弱锚点：模板无 {{KEY}} 占位符时按术语定位，只作跳转标记，不改写文本 */
-.docx-page .hit.hit-loose {
-  background: rgba(37, 99, 235, 0.10);
-  border: 1px dashed rgba(37, 99, 235, 0.5);
-  color: inherit;
-  cursor: pointer;
-  border-radius: 2px;
-  padding: 0 2px;
-}
-.docx-page.final .hit.tok-unknown { display: none; }
-.docx-page.final .hit.tok-deleted { background: #fff; color: transparent; border-color: transparent; }
-.docx-page .hit::before { display: none; }
-.pdf-page-wrap {
-  position: relative;
-  background: #fff;
-  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.10);
-  border-radius: 6px;
-  overflow: hidden;
-  /* flex 纵向滚动容器内不许被压缩，否则多页被压扁、失去滚动溢出 */
-  flex: 0 0 auto;
-}
-/* 底层：PDF.js canvas 渲染出的整页图片 */
-.pdf-canvas-img {
-  display: block;
-  width: 100%;
-  height: 100%;
-  user-select: none;
-  -webkit-user-drag: none;
-}
-/* 顶层：变量 overlay，透明背景、绝对定位覆盖在整页图片之上 */
-.doc-page {
-  position: absolute;
-  inset: 0;
-  padding: 0;
-  font-family: "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  color: #1f2937;
-  background: transparent;
-}
-/* ---------- Token 徽标（绝对定位到 PDF 坐标，覆盖在 canvas 正文之上） ---------- */
-.hit {
-  position: absolute;
-  display: inline-block;
-  box-sizing: border-box;
-  padding: 0 3px;
-  border-radius: 3px;
-  font-weight: 600;
-  line-height: 1.25;
-  white-space: pre-wrap;
-  word-break: break-word;
-  cursor: pointer;
-  transition: background-color 0.15s ease, outline 0.15s ease;
-}
-.hit.tok-ok {
-  background: linear-gradient(180deg, #d6f1e3 0%, #e9faf2 100%);
-  border: 1px solid #9fe1cb;
-  color: #0a4d3c;
-}
-.hit.tok-ok-empty {
-  background: rgba(16, 185, 129, 0.12);
-  border: 1px dashed #9fe1cb;
-  color: #0f6e56;
-}
-.hit.tok-warn {
-  background: rgba(253, 186, 116, 0.35);
-  border: 1px solid #f1b878;
-  color: #8a4a13;
-}
-.hit.tok-unknown {
-  background: rgba(180, 180, 180, 0.20);
-  border: 1px dashed #aaa;
-  color: #555;
-  font-family: var(--mono, ui-monospace, "Cascadia Mono", Menlo, monospace);
-  font-size: 0.9em;
-}
-/* 删除 / 不使用：白底抹掉原文 + 红斜线 */
-.hit.tok-deleted {
-  background: #ffffff;
-  border: 1px solid #d9534f;
-  color: #c0392b;
-  position: relative;
-}
-.hit.tok-deleted::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: linear-gradient(
-    to top right,
-    transparent calc(50% - 1px),
-    rgba(217, 83, 79, 0.85) calc(50% - 1px),
-    rgba(217, 83, 79, 0.85) calc(50% + 1px),
-    transparent calc(50% + 1px)
-  );
-  pointer-events: none;
-}
-.hit:hover { box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12); }
-
-/* ---------- Final 最终预览：去掉审阅徽标，白底遮盖原文并显示替换值 ---------- */
-.doc-page.final .hit { background: #fff; border: none; color: #1f2937; font-weight: 400; box-shadow: none; }
-.doc-page.final .hit.tok-unknown { display: none; }
-.doc-page.final .hit.tok-deleted { background: #fff; color: transparent; border: none; }
-.doc-page.final .hit.tok-deleted::before { display: none; }
-
-/* ---------- 联动高亮（locateTokenInEditor 直接 DOM toggle） ---------- */
-.hit.hit-all {
-  outline: 2px dashed var(--primary, #2563eb);
-  outline-offset: 1px;
-}
-.hit.hit-current {
-  outline: 3px solid #f59e0b !important;
-  outline-offset: 2px;
-  background: rgba(245, 158, 11, 0.22) !important;
-  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.18);
-}
-.hit.flash {
-  animation: hitFlash 1.4s ease-out;
-}
-@keyframes hitFlash {
-  0%   { box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.45); transform: scale(1.05); }
-  60%  { box-shadow: 0 0 0 10px rgba(37, 99, 235, 0); transform: scale(1); }
-  100% { box-shadow: 0 0 0 0 rgba(37, 99, 235, 0); transform: scale(1); }
-}
-
-/* 审阅调整点抽屉：绝对定位覆盖于 doc-view 右侧，宽度放大 */
-.de-review-drawer {
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: min(560px, 95%);
-  background: #fff;
-  border-left: 1px solid var(--border, #e2e2e2);
-  box-shadow: -10px 0 26px rgba(0, 0, 0, 0.09);
-  z-index: 6;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
-.de-review-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border, #e2e2e2);
-  font-size: 13.5px;
-}
-.de-review-hint {
-  padding: 8px 14px 10px;
-  font-size: 12px;
-  color: var(--muted, #888);
-  border-bottom: 1px dashed var(--border, #e2e2e2);
-  background: rgba(37, 99, 235, 0.04);
-}
-.de-review-list {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow: auto;
-  padding: 10px 12px;
-  display: grid;
-  gap: 8px;
-  align-content: start;
-}
-.slide-right-enter-active,
-.slide-right-leave-active { transition: transform 0.18s ease, opacity 0.18s ease; }
-.slide-right-enter-from,
-.slide-right-leave-to { transform: translateX(40px); opacity: 0; }
-.rp-item.flash {
-  outline: 3px solid var(--primary, #2563eb);
-  outline-offset: 2px;
-  animation: tplFlash 1.4s ease-out;
-}
-.rp-result {
-  font-size: 11.5px;
-  color: #0f6e56;
-  background: rgba(16, 185, 129, 0.1);
-  border-radius: 4px;
-  padding: 2px 6px;
-  margin-top: 4px;
-  display: inline-block;
-  word-break: break-word;
-}
-
-/* 文稿 PDF 原生预览（doc 与 preview 共用：右栏全文铺满） */
-.doc-pdf-frame {
-  width: 100%;
-  height: 100%;
-  min-height: 600px;
-  border: 1px solid var(--border, #e2e2e2);
-  border-radius: 8px;
-  background: #fff;
-}
-.rp-item {
-  background: #fff;
-  border: 1px solid var(--border, #e2e2e2);
-  border-radius: 7px;
-  padding: 8px 9px;
-  font-size: 12px;
-  line-height: 1.55;
-  cursor: pointer;
-}
-.rp-item:hover,
-.rp-item.selected {
-  border-color: var(--primary, #2563eb);
-}
-.rp-item .rp-anchor {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 11px;
-  color: var(--primary, #2563eb);
-  margin-top: 3px;
-}
-.rp-empty {
-  padding: 14px;
-  color: var(--muted, #888);
-  font-size: 12px;
-}
-.btn.review-toggle.on {
-  background: rgba(37, 99, 235, 0.08);
-  border-color: #b5d4f4;
-  color: var(--primary, #2563eb);
-}
-
-/* 变量影响关系矩阵（原型 .matrix-wrap） */
-.matrix-wrap {
-  border: 1px solid var(--border, #e2e2e2);
-  border-radius: 10px;
-  background: #fff;
-  overflow: auto;
-  min-height: min(760px, calc(100vh - 320px));
-}
-.matrix-wrap table {
-  border-collapse: collapse;
-  width: 100%;
-  font-size: 12.5px;
-}
-.matrix-wrap th,
-.matrix-wrap td {
-  border-bottom: 1px solid var(--border, #e2e2e2);
-  border-right: 1px solid var(--border, #e2e2e2);
-  padding: 8px 10px;
-  text-align: left;
-  vertical-align: top;
-}
-.matrix-wrap thead th {
-  background: rgba(127, 127, 127, 0.04);
-  position: sticky;
-  top: 0;
-}
-.matrix-wrap td.cell-empty {
-  color: var(--muted, #888);
-  text-align: center;
-}
-.matrix-wrap td .cell-anchor {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 11px;
-  color: var(--primary, #2563eb);
-}
-.matrix-wrap td .cell-result {
-  color: var(--text, #555);
-  margin-top: 3px;
-  line-height: 1.5;
-}
-/* ---------- 桑基图（变量 → 改写动作 → 文件落点） ---------- */
-.matrix-wrap.fullscreen {
-  position: fixed;
-  inset: 12px;
-  z-index: 60;
-  min-height: 0;
-  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.3);
-}
-.matrix-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border, #e2e2e2);
-  position: sticky;
-  top: 0;
-  background: #fff;
-  z-index: 2;
-}
-.matrix-search {
-  width: 200px;
-}
-.matrix-toolbar-right {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-left: auto;
-  flex-wrap: wrap;
-}
-.sankey-wrap {
-  padding: 12px 14px;
-  display: grid;
-  gap: 10px;
-}
-.sankey-svg {
-  width: 100%;
-  height: auto;
-  max-height: calc(100vh - 340px);
-  min-height: 240px;
-  background:
-    linear-gradient(to right, transparent calc(25% - 1px), rgba(127, 127, 127, 0.06) 25%, transparent 25%),
-    #fff;
-}
-.matrix-wrap.fullscreen .sankey-svg {
-  max-height: calc(100vh - 220px);
-}
-.sankey-link {
-  fill: none;
-  stroke: #b9c4d4;
-  stroke-width: 7;
-  stroke-opacity: 0.35;
-  stroke-linecap: round;
-  transition: stroke-opacity 0.15s ease, stroke 0.15s ease;
-}
-.sankey-link.file {
-  stroke-width: 5;
-}
-.sankey-link.on {
-  stroke: var(--primary, #2563eb);
-  stroke-opacity: 0.85;
-}
-.sankey-link.dim {
-  stroke: #dde3ec;
-  stroke-opacity: 0.3;
-}
-.sankey-node {
-  cursor: default;
-}
-.sankey-node rect {
-  fill: #f4f6fa;
-  stroke: #c3cbd9;
-  stroke-width: 1;
-  transition: fill 0.15s ease, stroke 0.15s ease;
-}
-.sankey-node.var {
-  cursor: pointer;
-}
-.sankey-node.var rect {
-  fill: #fff7ee;
-  stroke: #ecbd8b;
-}
-.sankey-node.var.confirmed rect {
-  fill: #e9faf2;
-  stroke: #9fe1cb;
-}
-.sankey-node.var:hover rect {
-  stroke: var(--primary, #2563eb);
-  stroke-width: 1.6;
-}
-.sankey-node.var.on rect {
-  stroke: var(--primary, #2563eb);
-  stroke-width: 2;
-  fill: #eaf1ff;
-}
-.sankey-node.file {
-  cursor: pointer;
-}
-.sankey-node.file rect {
-  fill: #eff6ff;
-  stroke: #93c5fd;
-}
-.sankey-node.file.on rect {
-  stroke: var(--primary, #2563eb);
-  stroke-width: 2;
-  fill: #dbeafe;
-}
-.sankey-node.act.on rect {
-  stroke: var(--primary, #2563eb);
-  stroke-width: 2;
-  fill: #eef2ff;
-}
-.sankey-node.dim rect {
-  opacity: 0.45;
-}
-.sankey-node.on rect {
-  opacity: 1;
-}
-.sankey-node .node-label {
-  font-size: 11px;
-  font-weight: 700;
-  fill: #2c3444;
-  dominant-baseline: middle;
-}
-.sankey-node .node-sub {
-  font-size: 9.5px;
-  fill: #8a93a6;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-}
-.sankey-cols {
-  display: grid;
-  grid-template-columns: 202px 140px 132px;
-  justify-content: space-between;
-  font-size: 11.5px;
-  font-weight: 700;
-  color: var(--muted, #888);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  padding: 0 2px;
-}
-.sankey-detail {
-  border: 1px solid var(--border, #e2e2e2);
-  border-radius: 10px;
-  background: #fbfcfe;
-  padding: 10px 12px;
-  display: grid;
-  gap: 8px;
-}
-.sankey-detail-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-.sankey-detail-head strong {
-  font-size: 13.5px;
-}
-.sankey-detail-head .btn {
-  margin-left: auto;
-}
-.sankey-detail-body {
-  display: grid;
-  gap: 4px 22px;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  font-size: 12.5px;
-}
-.sankey-detail-body > div {
-  display: flex;
-  gap: 8px;
-  align-items: baseline;
-}
-.sankey-detail-body b {
-  color: var(--muted, #888);
-  font-weight: 600;
-  white-space: nowrap;
-}
-.matrix-table {
-  padding: 4px 12px 12px;
-}
-.matrix-legend {
-  display: flex;
-  gap: 14px;
-  flex-wrap: wrap;
-  font-size: 12px;
-  color: var(--muted, #888);
-  padding: 8px 2px 0;
-}
-
-/* 专注模式：fixed 铺满整个视口（低于弹窗/提示层级），ESC 或按钮退出 */
-.doc-split.is-focus {
-  position: fixed;
-  inset: 0;
-  z-index: 50;
-  grid-template-columns: minmax(460px, 40%) minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr);
-  gap: 14px;
-  padding: 16px;
-  background: var(--bg, #f4f5f7);
-  overflow: hidden;
-}
-.doc-split.is-focus > .doc-pane {
-  height: 100%;
-  min-height: 0;
-}
-.doc-split.is-focus .doc-pdf-frame {
-  height: 100%;
-}
-
-/* 窄屏折叠为单列（专注模式始终双列铺满视口） */
-@media (max-width: 1024px) {
-  .doc-split:not(.is-focus) {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto auto;
-  }
-  .doc-split > .doc-pane:first-child {
-    height: auto;
-    min-height: 0;
-  }
-  /* 单列时 PDF 面板必须拿到确定的视口高度，否则 auto 行内容坍塌、无法滚动浏览 */
-  .doc-split:not(.is-focus) > .doc-pane:last-child {
-    height: calc(100vh - 230px);
-    min-height: 640px;
-  }
-  .doc-split-body {
-    grid-template-columns: minmax(0, 1fr);
-  }
+<style scoped>
+.preview-card.preview-card--immersive { position: fixed; inset: 0; z-index: 100; height: 100dvh; box-sizing: border-box; border-radius: 0; display: flex; flex-direction: column; gap: 4px; padding: 8px 12px; overflow: hidden; background: var(--surface); }
+.preview-card--immersive > * { flex-shrink: 0; }
+.preview-card--immersive .document-surface { flex: 1 1 0; min-height: 0; overflow: hidden; }
+.document-info { display: contents; }
+.preview-card--immersive .document-info { position: absolute; top: 88px; right: 12px; z-index: 8; width: min(540px, calc(100% - 24px)); max-height: min(50dvh, 420px); box-sizing: border-box; padding: 16px; overflow: auto; display: flex; flex-direction: column; gap: 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+.preview-card--immersive .document-tools { margin: 0; }
+.card-head .document-tools { margin: 0; }
+.preview-card--immersive .flow-actions { margin-top: 0; padding-top: 4px; }
+.regeneration-warning { flex: 1; text-align: right; }
+.preview-card--immersive .draft-unresolved { position: absolute; right: 12px; bottom: 74px; z-index: 7; width: min(480px, calc(100% - 24px)); max-height: calc(100dvh - 180px); margin: 0; padding: 10px 12px; box-sizing: border-box; overflow: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+.preview-card--immersive .draft-unresolved:not([open]) { width: min(310px, calc(100% - 24px)); bottom: 58px; padding: 6px 12px; }
+.preview-card--immersive .draft-unresolved > summary { position: sticky; top: -10px; z-index: 1; padding: 4px 0; background: var(--surface); }
+.preview-card--immersive .document-versions { max-height: min(18dvh, 140px); overflow: auto; }
+.draft-flow:has(.preview-card--immersive) :deep(.modal-backdrop) { z-index: 120; }
+.preview-card.preview-card--immersive h3, .preview-card.preview-card--immersive p { margin: 0; }
+.document-revision-status { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; overflow-wrap: anywhere; }
+.document-revision-status strong { color: var(--amber); }
+.document-versions { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.document-versions summary { cursor: pointer; }
+.draft-flow {
+  --draft-reading-width: clamp(460px, calc((100vw - var(--workspace-sidebar) - 80px) * .42), 600px);
+  width: 100%; max-width: 1560px; margin: 0 auto; padding: 24px 28px 42px;
+  display: flex; flex-direction: column; gap: 16px; color: var(--ink);
+}
+.flow-head,.card-head,.variable-head,.flow-actions,.input-intro,.document-tools,.row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+}
+.row { justify-content: flex-start; }
+h2,h3,p { margin: 0; }
+h2 { font-size: 22px; line-height: 1.3; }
+.flow-head p { margin-top: 5px; color: var(--muted); font-size: 13px; }
+.flow-count { font-size: 11.5px; font-weight: 700; padding: 5px 10px; background: var(--accent-soft); color: var(--accent-dark); border-radius: 999px; white-space: nowrap; }
+.flow-steps { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 8px; }
+.flow-steps button { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; min-height: 46px; text-align: left; color: var(--ink-soft); font: inherit; font-size: 12px; font-weight: 600; }
+.flow-steps button.active { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-dark); }
+.source-stack,.input-stack { display: flex; flex-direction: column; gap: 12px; padding: 16px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); min-width: 0; }
+.flow-card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; min-width: 0; }
+.flow-card h3 { font-size: 14px; line-height: 1.4; }
+.group-number { display: inline-flex; align-items: center; justify-content: center; background: var(--accent-soft); color: var(--accent-dark); width: 22px; height: 22px; border-radius: 50%; margin-right: 8px; font-size: 11px; }
+.source-row { display: grid; grid-template-columns: 45px minmax(0,1fr) auto; gap: 12px; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.source-row:last-child { border: 0; }
+.source-row small,.evidence-row small { color: var(--muted); display: block; font-size: 12px; line-height: 1.55; margin-top: 5px; }
+.source-row div { overflow-wrap: anywhere; }
+.evidence-row { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.evidence-row>span { float: right; font-size: 12px; color: var(--muted); }
+label.btn input[type=file] { display: none; }
+.disabled { opacity: .5; pointer-events: none; }
+.variable { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.variable:last-of-type { border-bottom: 0; }
+.variable-head { justify-content: flex-end; gap: 8px; margin-bottom: 4px; }
+.variable.source-selected { border-left: 3px solid var(--accent); padding-left: 10px; }
+.btn.text-link { min-height: 26px; padding: 0 4px; border-color: transparent; background: transparent; color: var(--accent-dark); font-size: 12px; }
+.btn.text-link:hover { background: var(--accent-soft); }
+.state { display: inline-flex; align-items: center; font-size: 11.5px; font-weight: 700; line-height: 1.4; border-radius: 999px; padding: 3px 8px; background: var(--surface-subtle); color: var(--muted); }
+.state.adopted,.state.manual { background: var(--green-soft); color: var(--green); }
+.field-save-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 10px; }
+.field-save-feedback { color: var(--muted); font-size: 12px; }
+.field-save-feedback.failed { color: var(--red); }
+.state.missing,.state.needs_review { background: var(--amber-soft); color: var(--amber); }
+.state.conflict { background: var(--red-soft); color: var(--red); }
+.hint,.field-evidence,.clause-details { font-size: 12px; color: var(--muted); line-height: 1.6; }
+.hint { margin: 6px 0; }
+.condition-note,.review-note { background: var(--amber-soft); color: var(--amber); padding: 8px 10px; border-radius: var(--radius-sm); font-size: 12px; line-height: 1.6; margin: 8px 0; }
+.field-evidence summary,.clause-details summary,.draft-unresolved summary { cursor: pointer; padding: 7px 0; }
+.field-evidence blockquote { border-left: 3px solid var(--line-strong); margin: 10px 0; padding-left: 12px; white-space: pre-wrap; color: var(--ink-soft); }
+.candidate { margin-top: 12px; padding: 12px 14px; background: var(--surface-subtle); border: 1px solid var(--line); border-radius: var(--radius); }
+.candidate pre { color: var(--ink); }
+.raw-text { white-space: pre-wrap; }
+.flow-actions { justify-content: flex-end; padding-top: 12px; border-top: 1px solid var(--line); margin-top: 4px; }
+.question-tools { display: flex; gap: 8px; }
+.question-tools>input { flex: 1; min-width: 0; }
+.question-tools>select { max-width: 200px; }
+.input-stack { container-type: inline-size; container-name: drafting-review; }
+.review-layout-switch { display: flex; flex-wrap: wrap; gap: 8px; }
+.question-review,.question-editor { min-width: 0; }
+.question-editor { display: flex; flex-direction: column; gap: 12px; }
+.question-review.focus { display: grid; grid-template-columns: minmax(0,1fr); align-items: start; gap: 16px; }
+.question-index { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow: auto; padding: 4px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-subtle); }
+.question-index-item { display: flex; align-items: flex-start; min-width: 0; width: 100%; gap: 4px; padding: 10px 8px; border: 1px solid transparent; border-radius: var(--radius-sm); background: transparent; color: var(--ink-soft); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
+.question-index-item[aria-current=step] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-dark); }
+.question-index-item:hover { background: var(--surface); }
+.question-index-item:focus-visible { outline: none; box-shadow: var(--focus); }
+.question-index-item>.group-number { flex-shrink: 0; margin-right: 3px; }
+.question-index-item>span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.question-index-item .state { display: table; margin-top: 6px; }
+.question-navigation { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); }
+@container drafting-review (min-width: 800px) {
+  .question-review.focus { grid-template-columns: 220px minmax(0,1fr); }
+  .question-index { max-height: min(64vh,640px); }
+}
+.flow-status { padding: 10px 12px; border-radius: var(--radius-sm); background: var(--accent-soft); color: var(--accent-dark); font-size: 12px; }
+.flow-error { padding: 10px 12px; background: var(--red-soft); color: var(--red); white-space: pre-wrap; border-radius: var(--radius-sm); line-height: 1.6; font-size: 12px; }
+.input-intro p { flex: 1; min-width: 270px; color: var(--muted); font-size: 12px; line-height: 1.55; }
+.clause-action { padding: 12px 0; border-bottom: 1px solid var(--line); line-height: 1.6; }
+.clause-action p { margin: 6px 0; }
+.clause-action pre { background: var(--surface-subtle); padding: 10px; }
+.document-tabs { display: flex; gap: 6px; }
+.preview-card h3 { margin: 16px 0; }
+.document-tools { justify-content: flex-start; margin: 12px 0; }
+.pdf-preview { width: 100%; height: 70vh; min-height: 470px; border: 1px solid var(--line); border-radius: var(--radius-sm); }
+.document-editor { height: 65vh; font-family: var(--font-mono); font-size: 13px; line-height: 1.7; }
+.draft-unresolved { margin-top: 16px; }
+input,select,textarea { width: 100%; box-sizing: border-box; min-height: 36px; border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; font: inherit; font-size: 13px; background: var(--surface); color: var(--ink); }
+textarea { resize: vertical; }
+label { display: block; font-size: 12px; margin: 10px 0; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; max-height: 50vh; overflow: auto; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+.template-side-panel {
+  position: fixed; z-index: 40; inset: 16px 16px 16px auto; width: min(600px,calc(100vw - 32px));
+  box-sizing: border-box; display: flex; flex-direction: column; gap: 12px; padding: 16px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); overflow: auto;
+}
+.template-side-panel>header { flex-shrink: 0; position: sticky; top: 0; z-index: 1; background: var(--surface); padding-bottom: 8px; }
+.template-side-panel>header h3 { font-size: 16px; }
+.template-side-panel :deep(.template-reading) { min-height: 0; flex: 1; border: 0; padding: 0; }
+@container workspace (min-width: 1200px) {
+  .draft-flow.with-template { width: auto; max-width: none; margin-left: 0; margin-right: calc(var(--draft-reading-width) + 28px); }
+  .template-side-panel { top: 88px; right: 28px; bottom: 24px; width: var(--draft-reading-width); }
+}
+@container workspace (max-width: 640px) {
+  .draft-flow { padding: 18px 16px 32px; }
+  .flow-steps { gap: 6px; }
+  .flow-steps button { padding: 9px 10px; font-size: 11.5px; }
+  .flow-card,.source-stack,.input-stack { padding: 12px; }
+  .source-row { grid-template-columns: 40px minmax(0,1fr); }
+  .source-row>button { grid-column: 2; justify-self: start; }
+  .question-tools { flex-wrap: wrap; }
+  .question-tools>input { flex-basis: 100%; }
+  .question-tools>select { flex: 1; max-width: none; }
+  .input-intro p { min-width: 100%; }
+  .flow-count { white-space: normal; }
+  .pdf-preview { min-height: 380px; }
+}
+@media(max-width: 560px) {
+  .template-side-panel { inset: 8px; width: auto; }
 }
 </style>
