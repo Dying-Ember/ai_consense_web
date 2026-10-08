@@ -44,3 +44,7 @@ Thumbs.db
 *.bak
 *.tmp
 *.ps1
+
+# Qdrant local runtime data (本地向量库运行产物，不提交)
+storage/
+.qdrant-initialized
