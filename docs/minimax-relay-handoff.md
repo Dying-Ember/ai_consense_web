@@ -30,6 +30,7 @@
 $env:SPRING_PROFILES_ACTIVE = 'h2,minimax-relay'
 $env:CONSENSE_MINIMAX_BASE_URL = 'http://10.149.131.175:8092'
 $env:CONSENSE_MINIMAX_RELAY_API_KEY = '<单独取得的中继 token>'
+$env:CONSENSE_ALLOWED_ORIGINS = 'http://localhost:5173,http://127.0.0.1:5173'
 mvn spring-boot:run
 ```
 
