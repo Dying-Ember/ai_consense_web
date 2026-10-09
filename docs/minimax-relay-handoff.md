@@ -2,6 +2,8 @@
 
 更新日期：2026-10-09。此文档面向在自己机器上运行 ConSense 前后端的开发同事。前端通过同事本机后端调用 MiniMax；用户的机器提供带独立访问 token 的中继，官方 MiniMax API key 只由中继服务器持有。
 
+合并并拉取前后端更新后，如果已经收到负责人提供的 `relay-client.env`，将它重命名为 `.env.relay`，放到 **后端仓库根目录，与 `pom.xml` 同级**。按后端 `docs/minimax-relay-handoff.md` 开头的快捷命令读取并启动：SDK 地址和 token 会自动映射为 Java 配置。前端只配置 `CONSENSE_API_TARGET`，此凭据文件不放进前端。
+
 ## 地址与凭据
 
 | 用途 | 地址或值 |
