@@ -14,6 +14,8 @@ npm run dev -- --host 127.0.0.1 --port 5173
 
 Set the API target to the companion service's actual port. This frontend requires the companion service contracts for catalogue, plan, source bytes, document bindings and saved revisions. Provider keys and stored project documents remain service configuration and are not embedded here. Frontend startup alone does not establish backend or model readiness.
 
+For the current shared MiniMax-M3 relay, follow [MiniMax relay setup, testing and development handoff](docs/minimax-relay-handoff.md). Run the companion backend with `h2,minimax-relay`, set `CONSENSE_API_TARGET` to that local backend, and keep the independent relay token in backend/client configuration. The frontend does not store a token. The handoff also describes using MiniMax for real-model regression tests and code analysis/modification, followed by independent validation.
+
 ```powershell
 npm run typecheck
 npm run build
