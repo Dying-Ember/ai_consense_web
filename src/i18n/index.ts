@@ -126,6 +126,7 @@ const zhHans = {
     }
   },
   vetting: {
+    sourceSetStale: '资料或审查范围已变化。这是旧资料批次的结果；请重新审查后导出当前报告，原人工核对记录仍保留。',
     title: '审查整份招标文件，按问题类型输出可复核的审查报告',
     subtitle: '分段核对审查源集，展示覆盖范围与证据出处；所有发现均需人工复核。',
     metrics: {
@@ -138,6 +139,10 @@ const zhHans = {
       source: '审查源集', upload: '上传整份招标文件材料', run: '运行审查', running: '正在审查…', export: '导出审查报告', exportStarted: '{format} 审查报告已生成并发起下载'
     },
     uploadRole: { label: '上传文件用途', auto: '自动识别', tender: '招标文件', standard: '标准依据', project_fact: '项目资料', package_manifest: '文件目录' },
+    documentScope: { label: '文件范围', auto: '自动识别范围', package: '本次文件包／参考依据', works_pss: '工程专项 PSS（排除）', pricing: '计价文件（排除）', example: '样板答案（排除）', drawing: '图纸（仅识别身份，排除解析）' },
+    checkStates: { checked_pass: '已执行并通过', issue: '有问题', insufficient_evidence: '依据不足', not_completed: '未完成／状态未知', not_applicable: '不适用' },
+    recovery: { NEW: '新审查', RESUMING: '正在从已核验检查点恢复', NEEDS_RERUN: '无法安全恢复，需重新审查', COMPLETED: '执行已完成', reliablePackets: '已保存的可靠检查包' },
+    checklist: { title: 'Appendix I · PRE 检查清单', note: '勾选只表示业务人员已核对并满足要求。未核对项目保留未检查；新审查批次不会沿用旧勾选。', unchecked: '未检查', fulfilled: '已核对并满足', not_applicable: '不适用（人工判定）', remarks: '合约团队备注', save: '保存本条检查', saved: '检查记录已保存', dirty: '检查清单有未保存修改，请先保存或恢复后再导出。', reset: '恢复已保存值' },
     toolbar: { searchPlaceholder: '搜索条款、文件或问题', allTypes: '全部类型', allScopes: '全部范围', intra: '文件内', inter: '跨文件' },
     locator: { file: '1. 文件', page: '2. 页码', variable: '2. 变量', errorClass: '2. 错误类别', all: '全部' },
     list: { empty: '没有符合条件的审查发现。' },
@@ -198,14 +203,20 @@ const zhHans = {
     findingSource: { rule: '规则检查', model: '模型建议' },
     evidenceSides: { source: '问题原文', target: '对照原文', baseline: '标准模板', reference: '参考依据', left: '证据 A', right: '证据 B' },
     review: { OPEN: '待处理', HANDLED: '已处理', ASSIGNED: '已分派', reopen: '重新打开', retained: '同一问题再次检出时保留已处理或已分派状态；新问题仍需人工复核。', team: '项目团队复核', remarks: '项目团队回复', actionTaken: '实际处理说明', addendum: '是否需纳入招标补遗', undecided: '待决定', required: '需要', notRequired: '不需要', save: '保存复核记录', discard: '放弃本次编辑', saved: '复核记录已保存', savedAt: '上次保存：', unsaved: '有未保存的编辑', unsavedExport: '请先保存或放弃以下审查项的复核编辑，再导出报告或重新审查：', saveFailed: '保存失败，编辑内容仍保留。请重试。' },
-    report: { format: '审查报告格式' },
+    report: { snapshot: '审查报告快照', format: '审查报告格式' },
     run: { empty: '尚未运行审查', started: '正在执行审查任务…', finished: '任务执行结束，返回 {count} 条待复核发现' }
   },
   advice: {
     title: '基于选定合约文件包进行提问',
     subtitle: '回答必须带合同条款或摘录；找不到依据时返回 I don\'t know，不补全。',
-    scopeNote: '范围：整份招标文件；回答只引用包内条款，找不到依据时返回 I don\'t know',
-    scope: { fullset: '选定合约条件', tender: '仅招标文件', contract: '仅合约条件' },
+    scopeNote: '与审查使用同一文件包；包括项目 PRE 和规范库依据，排除工程专项 PSS、计价文件和样板答案。采用版本和范围仍须核对。',
+    scope: { fullset: '完整文件包及依据', tender: '仅招标文件', contract: '合约条件及规范' },
+    clarifications: '回答前需要补充的背景',
+    replyClarification: '回复以上澄清',
+    replyMode: '补充原问题的背景；用户陈述不作为合同原文引用。',
+    newQuestion: '取消回复，提出新问题',
+    referenceOnly: '这是标准条文本身的解释，尚未确认本次项目采用该版本及条款。',
+    sourceScope: { title: '本次咨询文件范围', note: '范围内不代表已建立索引；文件需有可用解析，并刷新证据索引后才能检索。索引状态见上方。灰色行排除在外；标准依据须结合合约采用版本、修订和排除范围阅读。', role: '资料用途', included: '在本次范围内', parsed: '已解析', partiallyParsed: '部分解析', parseUnavailable: '暂无可用解析', reasons: { drawing_outside_scope: '图纸只识别身份，排除解析与咨询', example_answer: '样板答案，仅作对照', pricing_document: '计价文件，超出比赛范围', project_works_specification: '工程专项 PSS，超出比赛范围', outside_tender_scope: '不在招标子范围', outside_contract_scope: '不在合约子范围' } },
     actions: { refreshIndex: '刷新证据索引', ask: '提问', precedence: '优先次序依据', clear: '清空对话' },
     placeholder: '输入合约问题，例如：SCC4.1 下的文件优先次序是什么？',
     evidenceMode: '证据模式已开启',
@@ -372,6 +383,7 @@ const zhHant: typeof zhHans = {
     }
   },
   vetting: {
+    sourceSetStale: '資料或審查範圍已變化。這是舊資料批次的結果；請重新審查後匯出目前報告，原人工核對記錄仍保留。',
     title: '審查整份招標文件，按問題類型輸出可覆核的審查報告',
     subtitle: '分段核對審查源集，展示覆蓋範圍與證據出處；所有發現均需人工覆核。',
     metrics: {
@@ -384,6 +396,10 @@ const zhHant: typeof zhHans = {
       source: '審查源集', upload: '上傳整份招標文件材料', run: '執行審查', running: '正在審查…', export: '匯出審查報告', exportStarted: '{format} 審查報告已產生並開始下載'
     },
     uploadRole: { label: '上傳文件用途', auto: '自動識別', tender: '招標文件', standard: '標準依據', project_fact: '項目資料', package_manifest: '文件目錄' },
+    documentScope: { label: '文件範圍', auto: '自動識別範圍', package: '本次文件包／參考依據', works_pss: '工程專項 PSS（排除）', pricing: '計價文件（排除）', example: '樣板答案（排除）', drawing: '圖紙（僅識別身分，排除解析）' },
+    checkStates: { checked_pass: '已執行並通過', issue: '有問題', insufficient_evidence: '依據不足', not_completed: '未完成／狀態未知', not_applicable: '不適用' },
+    recovery: { NEW: '新審查', RESUMING: '正在從已核驗檢查點恢復', NEEDS_RERUN: '無法安全恢復，需重新審查', COMPLETED: '執行已完成', reliablePackets: '已儲存的可靠檢查包' },
+    checklist: { title: 'Appendix I · PRE 檢查清單', note: '勾選只表示業務人員已核對並滿足要求。未核對項目保留未檢查；新審查批次不會沿用舊勾選。', unchecked: '未檢查', fulfilled: '已核對並滿足', not_applicable: '不適用（人工判定）', remarks: '合約團隊備註', save: '儲存本條檢查', saved: '檢查記錄已儲存', dirty: '檢查清單有未儲存修改，請先儲存或恢復後再匯出。', reset: '恢復已儲存值' },
     toolbar: { searchPlaceholder: '搜尋條款、文件或問題', allTypes: '全部類型', allScopes: '全部範圍', intra: '文件內', inter: '跨文件' },
     locator: { file: '1. 文件', page: '2. 頁碼', variable: '2. 變量', errorClass: '2. 錯誤類別', all: '全部' },
     list: { empty: '沒有符合條件的審查發現。' },
@@ -444,14 +460,20 @@ const zhHant: typeof zhHans = {
     findingSource: { rule: '規則檢查', model: '模型建議' },
     evidenceSides: { source: '問題原文', target: '對照原文', baseline: '標準模板', reference: '參考依據', left: '證據 A', right: '證據 B' },
     review: { OPEN: '待處理', HANDLED: '已處理', ASSIGNED: '已分派', reopen: '重新開啟', retained: '同一問題再次檢出時保留已處理或已分派狀態；新問題仍需人工覆核。', team: '項目團隊覆核', remarks: '項目團隊回覆', actionTaken: '實際處理說明', addendum: '是否需納入招標補遺', undecided: '待決定', required: '需要', notRequired: '不需要', save: '儲存覆核記錄', discard: '放棄本次編輯', saved: '覆核記錄已儲存', savedAt: '上次儲存：', unsaved: '有未儲存的編輯', unsavedExport: '請先儲存或放棄以下審查項的覆核編輯，再匯出報告或重新審查：', saveFailed: '儲存失敗，編輯內容仍保留。請重試。' },
-    report: { format: '審查報告格式' },
+    report: { snapshot: '審查報告快照', format: '審查報告格式' },
     run: { empty: '尚未執行審查', started: '正在執行審查任務…', finished: '任務執行結束，返回 {count} 條待覆核發現' }
   },
   advice: {
     title: '基於選定合約文件包進行提問',
     subtitle: '回答必須帶合約條款或摘錄；找不到依據時返回 I don\'t know，不補全。',
-    scopeNote: '範圍：整份招標文件；回答只引用包內條款，找不到依據時返回 I don\'t know',
-    scope: { fullset: '選定合約條件', tender: '僅招標文件', contract: '僅合約條件' },
+    scopeNote: '與審查使用同一文件包；包括項目 PRE 和規範庫依據，排除工程專項 PSS、計價文件和樣板答案。採用版本和範圍仍須核對。',
+    scope: { fullset: '完整文件包及依據', tender: '僅招標文件', contract: '合約條件及規範' },
+    clarifications: '回答前需要補充的背景',
+    replyClarification: '回覆以上澄清',
+    replyMode: '補充原問題的背景；用戶陳述不作為合約原文引用。',
+    newQuestion: '取消回覆，提出新問題',
+    referenceOnly: '這是標準條文本身的解釋，尚未確認本次項目採用該版本及條款。',
+    sourceScope: { title: '本次諮詢文件範圍', note: '範圍內不代表已建立索引；文件需有可用解析，並重新整理證據索引後才能檢索。索引狀態見上方。灰色行排除在外；標準依據須結合合約採用版本、修訂和排除範圍閱讀。', role: '資料用途', included: '在本次範圍內', parsed: '已解析', partiallyParsed: '部分解析', parseUnavailable: '暫無可用解析', reasons: { drawing_outside_scope: '圖紙只識別身分，排除解析與諮詢', example_answer: '樣板答案，只作對照', pricing_document: '計價文件，超出比賽範圍', project_works_specification: '工程專項 PSS，超出比賽範圍', outside_tender_scope: '不在招標子範圍', outside_contract_scope: '不在合約子範圍' } },
     actions: { refreshIndex: '重新整理證據索引', ask: '提問', precedence: '優先次序依據', clear: '清空對話' },
     placeholder: '輸入合約問題，例如：SCC4.1 下的文件優先次序是什麼？',
     evidenceMode: '證據模式已開啟',
@@ -618,6 +640,7 @@ const en: typeof zhHans = {
     }
   },
   vetting: {
+    sourceSetStale: 'The source package or review scope has changed. These results belong to the previous package. Review the current package before exporting; previous human checks are retained.',
     title: 'Vet the assembled tender package and report reviewable findings by type',
     subtitle: 'Review source documents in segments with coverage and evidence locations shown. All findings require human review.',
     metrics: {
@@ -630,6 +653,10 @@ const en: typeof zhHans = {
       source: 'Review source set', upload: 'Upload tender package', run: 'Run vetting', running: 'Vetting…', export: 'Export report', exportStarted: '{format} review report generated and download started'
     },
     uploadRole: { label: 'Upload purpose', auto: 'Auto detect', tender: 'Tender documents', standard: 'Standard references', project_fact: 'Project information', package_manifest: 'Document inventory' },
+    documentScope: { label: 'Document scope', auto: 'Auto detect scope', package: 'Selected package / references', works_pss: 'Works-related PSS (excluded)', pricing: 'Pricing documents (excluded)', example: 'Sample answers (excluded)', drawing: 'Drawings (identity only; parsing excluded)' },
+    checkStates: { checked_pass: 'Executed and passed', issue: 'Issue', insufficient_evidence: 'Insufficient evidence', not_completed: 'Not completed / state unknown', not_applicable: 'Not applicable' },
+    recovery: { NEW: 'New review', RESUMING: 'Resuming verified checkpoints', NEEDS_RERUN: 'Safe recovery unavailable; rerun required', COMPLETED: 'Execution completed', reliablePackets: 'Persisted reliable check packets' },
+    checklist: { title: 'Appendix I · PRE checklist', note: 'Mark fulfilled only after the business reviewer has checked compliance. Unassessed items remain unchecked; a new review run starts a new checklist.', unchecked: 'Unchecked', fulfilled: 'Checked and fulfilled', not_applicable: 'Not applicable (human decision)', remarks: 'Remarks by Contract Team', save: 'Save this check', saved: 'Check saved', dirty: 'Checklist changes are unsaved. Save or restore them before exporting.', reset: 'Restore saved value' },
     toolbar: { searchPlaceholder: 'Search clause, document or issue', allTypes: 'All types', allScopes: 'All scopes', intra: 'Intra-file', inter: 'Cross-file' },
     locator: { file: '1. File', page: '2. Page', variable: '2. Variable', errorClass: '2. Error class', all: 'All' },
     list: { empty: 'No findings match the current filters.' },
@@ -690,14 +717,20 @@ const en: typeof zhHans = {
     findingSource: { rule: 'Rule check', model: 'Model suggestion' },
     evidenceSides: { source: 'Issue text', target: 'Comparison text', baseline: 'Standard template', reference: 'Reference basis', left: 'Evidence A', right: 'Evidence B' },
     review: { OPEN: 'Open', HANDLED: 'Handled', ASSIGNED: 'Assigned', reopen: 'Reopen', retained: 'Previously handled or assigned findings retain their review status when detected again. New findings still require review.', team: 'Project team review', remarks: 'Remarks by project team', actionTaken: 'Action taken', addendum: 'Include in tender addendum', undecided: 'Undecided', required: 'Required', notRequired: 'Not required', save: 'Save review record', discard: 'Discard edits', saved: 'Review record saved', savedAt: 'Last saved:', unsaved: 'Unsaved edits', unsavedExport: 'Save or discard review edits for these findings before exporting or starting another review:', saveFailed: 'Save failed. Your edits are retained; please retry.' },
-    report: { format: 'Report format' },
+    report: { snapshot: 'Report snapshot', format: 'Report format' },
     run: { empty: 'Vetting has not been run yet', started: 'Running the vetting task…', finished: 'Task execution ended with {count} findings for review' }
   },
   advice: {
     title: 'Ask questions against the selected contract package',
     subtitle: 'Answers must carry a clause or excerpt; when no basis is found the system returns I don\'t know.',
-    scopeNote: 'Scope: the complete tender document package; answers cite in-package clauses only.',
-    scope: { fullset: 'Selected package conditions', tender: 'Tender documents only', contract: 'Conditions of Contract only' },
+    scopeNote: 'Uses the same package as vetting, including project PRE and library references; excludes works-related PSS, pricing documents and sample answers. Applicable editions and scope still require checking.',
+    scope: { fullset: 'Complete package and references', tender: 'Tender documents only', contract: 'Contract conditions and specifications' },
+    clarifications: 'Background needed before answering',
+    replyClarification: 'Reply to these clarifications',
+    replyMode: 'Add background to the original question. User statements are not contract citations.',
+    newQuestion: 'Cancel reply and ask a new question',
+    referenceOnly: 'Reference provision explanation only. Adoption of this edition and provision by the selected project has not been confirmed.',
+    sourceScope: { title: 'Documents in this advice scope', note: 'In scope does not mean indexed. Retrieval requires usable parsed content and a refreshed evidence index; see the index status above. Grey rows are excluded. Read library provisions with the contract edition, amendments and exclusions.', role: 'Source role', included: 'In this scope', parsed: 'Parsed', partiallyParsed: 'Partially parsed', parseUnavailable: 'No usable parsing yet', reasons: { drawing_outside_scope: 'Drawing identity only; excluded from parsing and advice', example_answer: 'Sample answer, comparison only', pricing_document: 'Pricing document, outside competition scope', project_works_specification: 'Works-related PSS, outside competition scope', outside_tender_scope: 'Outside tender subset', outside_contract_scope: 'Outside contract subset' } },
     actions: { refreshIndex: 'Refresh evidence index', ask: 'Ask', precedence: 'Precedence basis', clear: 'Clear chat' },
     placeholder: 'Ask a contract question, e.g. What is the order of precedence under SCC4.1?',
     evidenceMode: 'Evidence mode on',

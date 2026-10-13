@@ -10,15 +10,16 @@ const source = await readFile(new URL('../src/views/VettingView.vue', import.met
 const script = parse(source).descriptor.scriptSetup.content.replace(/^import .*\r?\n/gm, '')
 const compiled = ts.transpileModule(script, { compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.None } }).outputText
 const setup = new Function('deps', `
-  const { computed, ref, watch, onMounted, onBeforeUnmount, useI18n, useAppStore, useLocalized, vettingApi, window } = deps;
+  const { computed, ref, watch, onMounted, onBeforeUnmount, useI18n, useRouter, useAppStore, useLocalized, vettingApi, ApiError, window } = deps;
   ${compiled}
   return { job, files, findings, running, exportDisabled, pollingPaused, selectedFinding, evidenceItems, reportFormat,
     uploadRole, uploadPackage, runVetting, restoreJob, retryPolling, openFinding, closeDrawer, updateStatus, exportReport,
-    reviewDraft, reviewDirty, reviewSaving, reviewFailed, hasUnsavedReview, saveReview, discardReview };
+    reviewDraft, reviewDirty, reviewSaving, reviewFailed, hasUnsavedReview, saveReview, discardReview,
+    uploadDocumentScope, checklist, checklistDirty, openChecklist, saveCheck, checkDirty, restoreCheck };
 `)
 
 const metrics = { total: 1, reference: 1, conflict: 0, language: 0, risk: 0, crossFile: 0 }
-const finding = (code, status = 'Open') => ({ code, status, fileKey: 'NTT', types: [], title: {}, body: {}, impact: {}, suggestion: {}, evidence: [] })
+const finding = (code, status = 'Open') => ({ code, status, runId: 'run-1', generatedRevisionSha256: 'generated', sourceSnapshotSha256: 'source', fileKey: 'NTT', types: [], title: {}, body: {}, impact: {}, suggestion: {}, evidence: [] })
 const active = (id = 'run-1') => ({ id, status: 'RUNNING', phase: 'segments', completedUnits: 1, totalUnits: 2, message: 'Reviewing' })
 const completed = (id = 'run-1') => ({ ...active(id), status: 'COMPLETED', completedUnits: 2, result: { total: 1, metrics, messages: [], model: 'test' } })
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r }); return { promise, resolve } }
@@ -30,19 +31,24 @@ function harness(overrides = {}) {
   const store = vue.reactive({ activeProjectId: 'A', locale: 'en', notify: text => notifications.push(text), setBusy() {}, clearBusy() {}, captureLlmSelection: () => ({ profileId: null }) })
   const api = {
     files: async () => [{ key: 'NTT', parsed: true }], findings: async () => [finding('F1', 'Handled')], metrics: async () => metrics,
-    latestRun: async () => null, startRun: async () => active(), getRun: async () => completed(),
+    latestRunProgress: async () => null, startRun: async () => active(), getRunProgress: async () => completed(), getRun: async (_project, id) => completed(id),
     evidence: async () => ({ title: 'Evidence', located: true, items: [] }),
     updateStatus: async (_project, code, status) => finding(code, status),
     updateReview: async (_project, code, review) => ({ ...finding(code), ...review, reviewUpdatedAt: '2026-10-02T03:00:00Z' }),
     uploadPackage: async (...args) => { uploads.push(args); return { messages: [] } },
+    checklist: async (_project, runId) => ({ runId, runSnapshotSha256: 'snapshot', sourceSnapshotSha256: 'source', writable: true, items: [
+      { id: 'APP-I-001', clause: 'PRE.B2', status: 'unchecked', remarks: '' },
+      { id: 'APP-I-002', clause: 'PRE.B3', status: 'unchecked', remarks: '' }
+    ] }),
+    saveChecklist: async (_project, binding, items) => ({ ...binding, writable: true, items }),
     exportReport: async (...args) => downloads.push(args), ...overrides
   }
   const scope = vue.effectScope()
   const view = scope.run(() => setup({
     computed: vue.computed, ref: vue.ref, watch: vue.watch,
     onMounted: fn => mounted.push(fn), onBeforeUnmount: fn => unmounted.push(fn),
-    useI18n: () => ({ t: key => key }), useAppStore: () => store,
-    useLocalized: () => ({ pick: value => value, currentKey: vue.ref('en') }), vettingApi: api,
+    useI18n: () => ({ t: key => key }), useRouter: () => ({ push: async () => undefined }), useAppStore: () => store,
+    useLocalized: () => ({ pick: value => value, currentKey: vue.ref('en') }), vettingApi: api, ApiError: class ApiError extends Error {},
     window: { setTimeout: (fn, delay) => { const id = ++timerId; timers.set(id, { fn, delay }); return id }, clearTimeout: id => timers.delete(id) }
   }))
   return { view, api, store, timers, downloads, uploads, notifications,
@@ -84,6 +90,10 @@ function harness(overrides = {}) {
   assert.equal(h.view.exportDisabled.value, false, 'completed zero-finding task permits export')
   await h.view.exportReport()
   assert.equal(h.downloads.length, 1)
+  h.view.job.value.sourceSetStale = true
+  assert.equal(h.view.exportDisabled.value, true, 'restoring a completed old source run does not re-enable current report export')
+  await h.view.exportReport()
+  assert.equal(h.downloads.length, 1)
   h.view.job.value = { ...active(), status: 'FAILED' }
   assert.equal(h.view.exportDisabled.value, true, 'failed latest task cannot export a previous report')
   h.dispose()
@@ -96,11 +106,38 @@ function harness(overrides = {}) {
   await h.view.uploadPackage({ target: { files } })
   assert.equal(h.uploads[0][2], undefined, 'auto role keeps server inference available')
   h.view.uploadRole.value = 'standard'
+  h.view.uploadDocumentScope.value = 'example'
   await h.view.uploadPackage({ target: { files } })
   assert.equal(h.uploads[1][2], 'standard', 'explicit upload purpose reaches the API')
+  assert.equal(h.uploads[1][3], 'example', 'scope exclusion is independent of source role')
   h.store.activeProjectId = 'B'
   await settle()
   assert.equal(h.view.uploadRole.value, 'auto', 'project change resets the next upload purpose')
+  assert.equal(h.view.uploadDocumentScope.value, 'auto')
+  h.dispose()
+}
+
+{
+  const h = harness(); await h.mount()
+  h.view.job.value = completed(); await settle()
+  await h.view.openChecklist({ target: { open: true } })
+  const [first, second] = h.view.checklist.value.items
+  first.status = 'fulfilled'; second.remarks = 'Separate pending check'
+  assert.equal(h.view.checklistDirty.value, true)
+  let discardedRunAttempts = 0
+  h.api.startRun = async () => { discardedRunAttempts++; return active('should-not-start') }
+  await h.view.runVetting()
+  assert.equal(discardedRunAttempts, 0, 'a new run cannot discard unsaved manual checklist judgments')
+  await h.view.uploadPackage({ target: { files: [{ name: 'replacement.docx' }] } })
+  assert.equal(h.uploads.length, 0, 'a source replacement cannot discard unsaved manual judgments')
+  assert.equal(h.view.exportDisabled.value, true, 'unsaved checklist must not silently disappear from report')
+  await h.view.saveCheck(first)
+  assert.equal(h.view.checkDirty(first), false)
+  assert.equal(h.view.checkDirty(second), true, 'saving a row preserves another row draft')
+  h.view.restoreCheck(second)
+  assert.equal(h.view.exportDisabled.value, false)
+  h.view.job.value = completed('new-run'); await settle()
+  assert.equal(h.view.checklist.value, null, 'old human checks do not cross into a new run')
   h.dispose()
 }
 
@@ -121,7 +158,7 @@ function harness(overrides = {}) {
 
 {
   const pending = deferred()
-  const h = harness({ latestRun: () => pending.promise })
+  const h = harness({ latestRunProgress: () => pending.promise })
   await h.mount()
   await h.view.uploadPackage({ target: { files: [{ name: 'updated.docx' }] } })
   pending.resolve(completed('old-snapshot'))
@@ -132,7 +169,7 @@ function harness(overrides = {}) {
 }
 
 {
-  const h = harness({ latestRun: async () => active('restored') })
+  const h = harness({ latestRunProgress: async () => active('restored') })
   await h.mount()
   assert.equal(h.view.job.value.id, 'restored', 'active task restored on open')
   h.dispose()
@@ -141,10 +178,10 @@ function harness(overrides = {}) {
 
 {
   const pending = deferred()
-  const h = harness({ latestRun: async () => active('old'), getRun: () => pending.promise })
+  const h = harness({ latestRunProgress: async () => active('old'), getRunProgress: () => pending.promise })
   await h.mount()
   await h.fire(2000)
-  h.api.latestRun = async () => completed('new')
+  h.api.latestRunProgress = async () => completed('new')
   h.store.activeProjectId = 'B'
   await settle()
   pending.resolve(completed('old'))
@@ -155,7 +192,8 @@ function harness(overrides = {}) {
 
 {
   const first = deferred(), second = deferred()
-  const h = harness({ evidence: (_id, code) => code === 'F1' ? first.promise : second.promise })
+  const h = harness({ findings: async () => [finding('F1'), finding('F2')], evidence: (_id, code) => code === 'F1' ? first.promise : second.promise })
+  await h.mount()
   h.view.openFinding(finding('F1'))
   h.view.openFinding(finding('F2'))
   second.resolve({ title: 'second', located: true, items: [{ code: 'SCT', text: 'correct evidence', pageNo: 'P2', side: 'target', located: true }] })
@@ -171,12 +209,12 @@ function harness(overrides = {}) {
 }
 
 {
-  const h = harness({ getRun: async () => { throw new Error('offline') } })
+  const h = harness({ getRunProgress: async () => { throw new Error('offline') } })
   await h.view.runVetting()
   await h.fire(2000)
   assert.equal(h.view.pollingPaused.value, true)
   assert.equal(h.view.job.value.status, 'RUNNING', 'network failure is not job failure')
-  h.api.getRun = async () => completed()
+  h.api.getRunProgress = async () => completed()
   h.view.retryPolling()
   await settle()
   assert.equal(h.view.job.value.status, 'COMPLETED')
@@ -197,6 +235,7 @@ function harness(overrides = {}) {
   assert.equal(h.view.exportDisabled.value, true, 'unsaved project-team reply cannot silently be omitted from export')
   await h.view.saveReview()
   assert.deepEqual(requests[0], { project: 'A', code: 'F1', review: {
+    expectedRunId: 'run-1', expectedGeneratedRevisionSha256: 'generated', expectedSourceSnapshotSha256: 'source',
     reviewRemarks: '  Not adopted: different objects.\nKeep the source exception.  ',
     actionTaken: 'Clarification recorded; no tender change.', addendumRequired: false
   } })
@@ -211,6 +250,7 @@ function harness(overrides = {}) {
 
 {
   const h = harness()
+  await h.mount()
   h.view.openFinding(finding('F1'))
   h.view.reviewDraft.value.reviewRemarks = 'Unsaved original reviewer reply'
   await h.view.updateStatus('Assigned')

@@ -1,0 +1,1 @@
+These JSON and 1x1 PNG fixtures are authored protocol test data copied unchanged from the companion service at source revision c971f873fef793c8ee2ec5a67294ece11ba01a4e. They are not competition originals, model outputs or source-quality gold. The local copy keeps frontend tests runnable from a standalone clone.

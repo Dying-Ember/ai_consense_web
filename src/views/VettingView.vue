@@ -1,15 +1,21 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { useRouter } from 'vue-router'
 import { vettingApi } from '@/api'
-import type { EvidenceBundle, Finding, FindingEvidence, VettingFile, VettingJob, VettingMetrics, VettingReportFormat, VettingSemanticTopic, VettingSourceRole } from '@/api/types'
+import { ApiError } from '@/api/client'
+import type { EvidenceBundle, Finding, FindingWriteBinding, FindingEvidence, VettingFile, VettingJob, VettingProgress, VettingMetrics, VettingReportFormat, VettingSemanticTopic, VettingSourceRole, DocumentScope, VettingChecklist, VettingChecklistItem } from '@/api/types'
 import { useAppStore } from '@/stores/app'
 import { useLocalized } from '@/composables/useLocalized'
 import AppIcon from '@/components/AppIcon.vue'
 import AppModal from '@/components/AppModal.vue'
+import CanonicalEvidencePanel from '@/components/CanonicalEvidencePanel.vue'
+import FixedBaselineEvidencePanel from '@/components/FixedBaselineEvidencePanel.vue'
+import { createReviewHandoff, newReviewHandoffToken, removeReviewHandoff, reviewHandoffCopy, storeReviewHandoff } from '@/advice/reviewHandoff'
 
 const { t } = useI18n()
 const store = useAppStore()
+const router = useRouter()
 const { pick, currentKey } = useLocalized()
 
 function reviewScopeStatus(topic: VettingSemanticTopic): string {
@@ -32,11 +38,13 @@ function requestStateLabel(status: string, kind: 'transportStates' | 'requestSta
 function packetBudgetStatus(status?: string): string {
   return status && ['budget_unknown', 'over_budget', 'observed_tokens', 'provider_estimated_fit'].includes(status) ? status : 'budget_unknown'
 }
+function checkStateLabel(status?: string): string { return t(`vetting.checkStates.${status && ['checked_pass', 'issue', 'insufficient_evidence', 'not_completed', 'not_applicable'].includes(status) ? status : 'not_completed'}`) }
 
 const files = ref<VettingFile[]>([])
 const findings = ref<Finding[]>([])
 const metrics = ref<VettingMetrics | null>(null)
-const job = ref<VettingJob | null>(null)
+type ObservedJob = VettingJob & { sourceVerification?: 'NOT_CHECKED' }
+const job = ref<ObservedJob | null>(null)
 const starting = ref(false)
 const uploading = ref(false)
 const statusSaving = ref(false)
@@ -47,17 +55,37 @@ const emptyReview = (): ReviewDraft => ({ reviewRemarks: '', actionTaken: '', ad
 const reviewDraft = ref<ReviewDraft>(emptyReview())
 const reviewBaseline = ref<ReviewDraft>(emptyReview())
 const reviewCode = ref<string | null>(null)
-const reviewDrafts = ref(new Map<string, ReviewDraft>())
+const reviewVersion = ref<string | null>(null)
+const reviewChanged = ref(false)
+const reviewDrafts = ref(new Map<string, { code: string; draft: ReviewDraft }>())
 const reviewDirty = computed(() => JSON.stringify(reviewDraft.value) !== JSON.stringify(reviewBaseline.value))
-const hasUnsavedReview = computed(() => reviewDirty.value || [...reviewDrafts.value.keys()].some(code => code !== reviewCode.value))
+const hasUnsavedReview = computed(() => reviewDirty.value || [...reviewDrafts.value.keys()].some(key => key !== reviewVersion.value))
+const retainedReviews = computed(() => [...reviewDrafts.value.entries()].filter(([key]) => key !== reviewVersion.value).map(([key, saved]) => ({ key, ...saved })))
 const unsavedReviewCodes = computed(() => [...new Set([
-  ...[...reviewDrafts.value.keys()].filter(code => code !== reviewCode.value),
+  ...[...reviewDrafts.value.entries()].filter(([key]) => key !== reviewVersion.value).map(([, saved]) => saved.code),
   ...(reviewDirty.value && reviewCode.value ? [reviewCode.value] : [])
 ])])
+const versionCopy = {
+  changed: { zhHans: '报告或来源版本已变化。草稿已保留，请刷新并核对当前版本后再填写；旧草稿不会自动写入新报告。', zhHant: '報告或來源版本已變化。草稿已保留，請刷新並核對目前版本後再填寫；舊草稿不會自動寫入新報告。', en: 'The report or source version changed. Your draft is retained. Refresh and review the current version before editing; old drafts are not applied to the new report.' },
+  refresh: { zhHans: '刷新当前版本', zhHant: '刷新目前版本', en: 'Refresh current version' },
+  retained: { zhHans: '保留的旧版本草稿', zhHant: '保留的舊版本草稿', en: 'Retained draft from an earlier version' },
+  discard: { zhHans: '丢弃保留草稿', zhHant: '捨棄保留草稿', en: 'Discard retained drafts' }
+}
 const exporting = ref(false)
 const pollingPaused = ref(false)
 const reportFormat = ref<VettingReportFormat>('pdf')
 const uploadRole = ref<'auto' | VettingSourceRole>('auto')
+const uploadDocumentScope = ref<DocumentScope>('auto')
+const checklist = ref<VettingChecklist | null>(null)
+const checklistBaseline = ref<VettingChecklistItem[]>([])
+const checklistLoading = ref(false)
+const checklistSaving = ref<string | null>(null)
+let checklistSequence = 0
+const retainedChecklists = ref<VettingChecklist[]>([])
+const checklistChanged = ref(false)
+const currentChecklistDirty = computed(() => checklist.value !== null && JSON.stringify(checklist.value.items) !== JSON.stringify(checklistBaseline.value))
+const checklistDirty = computed(() => currentChecklistDirty.value || retainedChecklists.value.length > 0)
+const checklistWritable = computed(() => checklist.value?.writable && !checklistChanged.value && checklist.value.runId === job.value?.id)
 const loading = ref(false)
 const selectedDetail = ref<Finding | null>(null)
 const evidenceLoading = ref(false)
@@ -68,6 +96,8 @@ let viewEpoch = 0
 let reloadSequence = 0
 let evidenceSequence = 0
 let jobSequence = 0
+let jobReadSequence = 0
+let pendingJobRead: { projectId: string; epoch: number; sequence: number; runId?: string; readSequence: number } | null = null
 let disposed = false
 const packageInput = ref<HTMLInputElement | null>(null)
 const sourceOpen = ref(false)
@@ -114,10 +144,13 @@ const BUCKET_LABELS: Record<string, { zhHans: string; zhHant: string; en: string
 }
 
 const selectedFinding = computed(() => selectedDetail.value)
-const running = computed(() => starting.value || isActiveJob(job.value))
+const handoffOpening = ref(false)
+const handoffDisabled = computed(() => !projectId.value || !selectedFinding.value || handoffOpening.value || evidenceLoading.value || running.value || uploading.value || reviewSaving.value || statusSaving.value || hasUnsavedReview.value || checklistDirty.value || checklistSaving.value !== null)
+const jobDetailsPending = computed(() => job.value?.sourceVerification === 'NOT_CHECKED' && !isActiveJob(job.value))
+const running = computed(() => starting.value || isActiveJob(job.value) || jobDetailsPending.value)
 const jobModelIdentity = computed(() => job.value?.modelIdentity ?? job.value?.result?.modelIdentity)
 const recordedJobModel = computed(() => jobModelIdentity.value?.model || job.value?.result?.model)
-const exportDisabled = computed(() => running.value || uploading.value || exporting.value || statusSaving.value || reviewSaving.value || hasUnsavedReview.value || job.value?.status !== 'COMPLETED')
+const exportDisabled = computed(() => running.value || uploading.value || exporting.value || statusSaving.value || reviewSaving.value || hasUnsavedReview.value || checklistDirty.value || checklistSaving.value !== null || job.value?.sourceSetStale === true || job.value?.status !== 'COMPLETED' || job.value?.sourceVerification === 'NOT_CHECKED')
 const coverage = computed(() => job.value?.coverage ?? job.value?.result?.coverage ?? null)
 const jobPercent = computed(() => {
   if (!job.value?.totalUnits) return null
@@ -130,8 +163,9 @@ const evidenceItems = computed<FindingEvidence[]>(() => {
       side: item.side ?? 'source', documentId: item.documentId,
       fileKey: item.fileKey ?? item.code, fileName: item.fileName ?? '',
       pageNo: item.pageNo, anchor: item.anchor, quote: item.quote ?? item.text,
-      located: item.located ?? evidence.value!.located, sourceHash: item.sourceHash, bbox: item.bbox,
-      packetId: item.packetId, packetSourceSnapshotSha256: item.packetSourceSnapshotSha256
+      located: item.located ?? evidence.value!.located, sourceHash: item.sourceHash, originalSourceSha256: item.originalSourceSha256, bbox: item.bbox,
+      packetId: item.packetId, packetSourceSnapshotSha256: item.packetSourceSnapshotSha256,
+      canonicalEvidence: item.canonicalEvidence, fixedBaselineEvidence: item.fixedBaselineEvidence
     }))
   }
   return selectedFinding.value?.evidence ?? []
@@ -152,10 +186,32 @@ function evidenceSide(side: string) {
 }
 
 function originalSourceUrl(item: FindingEvidence) {
-  if (!projectId.value || !item.documentId || !item.sourceHash) return null
+  if (item.fixedBaselineEvidence || /^(?:fixed:|fixed-baseline:|fixed_reference:)/.test(String(item.documentId ?? ''))) return null
+  if (!projectId.value || !item.documentId || !item.sourceHash || !item.originalSourceSha256) return null
   const page = /^P(\d+)$/i.exec(item.pageNo ?? '')
   const fragment = page && item.fileName.toLowerCase().endsWith('.pdf') ? `#page=${page[1]}` : ''
-  return `/api/vetting/${encodeURIComponent(projectId.value)}/sources/${encodeURIComponent(String(item.documentId))}/original?sourceHash=${encodeURIComponent(item.sourceHash)}${fragment}`
+  return `/api/vetting/${encodeURIComponent(projectId.value)}/sources/${encodeURIComponent(String(item.documentId))}/original?${new URLSearchParams({ sourceHash: item.sourceHash, originalSourceSha256: item.originalSourceSha256 })}${fragment}`
+}
+
+async function consultFinding() {
+  if (handoffDisabled.value || !selectedFinding.value) return
+  const finding = selectedFinding.value
+  let token: string | undefined
+  let draftStorage: Storage | undefined
+  handoffOpening.value = true
+  try {
+    token = newReviewHandoffToken()
+    draftStorage = sessionStorage
+    storeReviewHandoff(draftStorage, createReviewHandoff({
+      projectId: projectId.value, findingCode: finding.code, title: finding.title, description: finding.body,
+      evidence: evidenceItems.value, sourceSetStale: job.value?.sourceSetStale === true
+    }, token))
+    const failure = await router.push({ name: 'advice', query: { review: token } })
+    if (failure) throw new Error('review_handoff_navigation_failed')
+  } catch {
+    if (token && draftStorage) removeReviewHandoff(draftStorage, token)
+    store.notify(pick(reviewHandoffCopy.transferFailed))
+  } finally { handoffOpening.value = false }
 }
 
 const canUseBuckets = computed(() => filters.value.group === 'conflict')
@@ -188,7 +244,7 @@ function bucketLabel(key: string) {
   return labels[currentKey.value] || labels.zhHans
 }
 
-async function reload() {
+async function reload(owner?: { sequence: number; runId: string }) {
   const id = projectId.value
   const epoch = viewEpoch
   const seq = ++reloadSequence
@@ -198,12 +254,23 @@ async function reload() {
     const [fileList, findingList, metricData] = await Promise.all([
       vettingApi.files(id), vettingApi.findings(id, { ...filters.value }), vettingApi.metrics(id)
     ])
-    if (disposed || epoch !== viewEpoch || seq !== reloadSequence || id !== projectId.value) return
+    if (disposed || epoch !== viewEpoch || seq !== reloadSequence || id !== projectId.value || (owner && !ownsJob(id, epoch, owner.sequence, owner.runId))) return
     files.value = fileList
     findings.value = findingList
     metrics.value = metricData
     const refreshed = findingList.find((item) => item.code === selectedCode.value)
-    if (refreshed) selectedDetail.value = refreshed
+    if (refreshed && selectedDetail.value) {
+      if (findingVersion(refreshed) !== findingVersion(selectedDetail.value) && (reviewDirty.value || reviewSaving.value || statusSaving.value)) {
+        rememberReviewDraft()
+        reviewChanged.value = true
+      } else {
+        if (findingVersion(refreshed) !== findingVersion(selectedDetail.value)) openFinding(refreshed)
+        else {
+          selectedDetail.value = refreshed
+          if (!reviewDirty.value && !reviewSaving.value) loadReviewDraft(refreshed)
+        }
+      }
+    }
   } finally {
     if (seq === reloadSequence && epoch === viewEpoch) loading.value = false
   }
@@ -214,62 +281,110 @@ function stopPolling() {
   pollTimer = undefined
 }
 
-function schedulePoll(id: string, runId: string, epoch: number) {
-  stopPolling()
-  if (disposed || epoch !== viewEpoch || id !== projectId.value) return
-  pollTimer = window.setTimeout(() => { void pollRun(id, runId, epoch) }, 2000)
+function ownsJob(id: string, epoch: number, sequence: number, runId?: string) {
+  return !disposed && epoch === viewEpoch && id === projectId.value && sequence === jobSequence
+    && (!runId || runId === job.value?.id)
 }
 
-async function acceptJob(value: VettingJob, id: string, epoch: number, notifyCompletion = false) {
-  if (disposed || epoch !== viewEpoch || id !== projectId.value) return
+function schedulePoll(id: string, runId: string, epoch: number, sequence: number) {
+  stopPolling()
+  if (!ownsJob(id, epoch, sequence, runId)) return
+  pollTimer = window.setTimeout(() => { void pollRun(id, runId, epoch, sequence) }, 2000)
+}
+
+async function acceptJob(value: VettingJob, id: string, epoch: number, sequence: number, notifyCompletion = false) {
+  if (!ownsJob(id, epoch, sequence)) return
   job.value = value
   pollingPaused.value = false
   if (isActiveJob(value)) {
-    schedulePoll(id, value.id, epoch)
+    schedulePoll(id, value.id, epoch, sequence)
   } else {
     stopPolling()
     if (notifyCompletion && value.status === 'COMPLETED') {
       store.notify(t('vetting.run.finished', { count: value.result?.total ?? 0 }))
-      await reload()
-      if (disposed || epoch !== viewEpoch || id !== projectId.value) return
-      // Findings may have acquired new codes. Close a detail from the previous run.
-      selectedCode.value = null
-      selectedDetail.value = null
-      drawerOpen.value = false
-      evidence.value = null
+      await reload({ sequence, runId: value.id })
+      if (!ownsJob(id, epoch, sequence, value.id)) return
+      if (!hasUnsavedReview.value && !reviewSaving.value && !statusSaving.value) {
+        selectedCode.value = null
+        selectedDetail.value = null
+        drawerOpen.value = false
+        evidence.value = null
+      }
     }
     if (notifyCompletion && value.status === 'FAILED') store.notify(value.error || value.message || t('vetting.job.failed'), 6000)
   }
 }
 
-async function pollRun(id: string, runId: string, epoch: number) {
-  if (disposed || epoch !== viewEpoch || id !== projectId.value) return
+async function acceptProgress(value: VettingProgress, id: string, epoch: number, sequence: number, readSequence: number, notifyCompletion = false) {
+  if (!ownsJob(id, epoch, sequence) || readSequence !== jobReadSequence) return
+  const previous = job.value?.id === value.id ? job.value : null
+  // Copy only progress fields. A previous successful source check is not a current one.
+  job.value = {
+    id: value.id, status: value.status, phase: value.phase, completedUnits: value.completedUnits,
+    totalUnits: value.totalUnits, message: value.message, error: value.error,
+    startedAt: value.startedAt, finishedAt: value.finishedAt, sourceSnapshotSha256: value.sourceSnapshotSha256,
+    modelIdentity: value.modelIdentity, sourceVerification: 'NOT_CHECKED',
+    ...(previous?.sourceSetStale === true ? { sourceSetStale: true } : {})
+  }
+  pollingPaused.value = false
+  if (isActiveJob(value)) {
+    schedulePoll(id, value.id, epoch, sequence)
+    return
+  }
+  stopPolling()
+  const detail = await vettingApi.getRun(id, value.id)
+  if (!ownsJob(id, epoch, sequence, value.id) || readSequence !== jobReadSequence) return
+  if (detail.id !== value.id) throw new Error('Vetting detail belongs to another run')
+  await acceptJob(detail, id, epoch, sequence, notifyCompletion)
+  if (!ownsJob(id, epoch, sequence, value.id) || readSequence !== jobReadSequence) return
+}
+
+async function pollRun(id: string, runId: string, epoch: number, sequence = jobSequence) {
+  if (!ownsJob(id, epoch, sequence, runId)) return
+  if (pendingJobRead?.projectId === id && pendingJobRead.epoch === epoch && pendingJobRead.sequence === sequence) return
+  const owner = { projectId: id, epoch, sequence, runId, readSequence: ++jobReadSequence }
+  pendingJobRead = owner
+  stopPolling()
   try {
-    const value = await vettingApi.getRun(id, runId)
-    if (job.value?.id !== runId) return
-    await acceptJob(value, id, epoch, true)
+    const value = await vettingApi.getRunProgress(id, runId)
+    if (!ownsJob(id, epoch, sequence, runId) || owner.readSequence !== jobReadSequence) return
+    if (value.id !== runId) throw new Error('Vetting progress belongs to another run')
+    await acceptProgress(value, id, epoch, sequence, owner.readSequence, true)
+    if (!ownsJob(id, epoch, sequence, runId) || owner.readSequence !== jobReadSequence) return
   } catch {
-    if (epoch === viewEpoch && id === projectId.value) pollingPaused.value = true
+    if (ownsJob(id, epoch, sequence, runId) && owner.readSequence === jobReadSequence) pollingPaused.value = true
+  } finally {
+    if (pendingJobRead === owner) pendingJobRead = null
   }
 }
 
 async function restoreJob() {
   const id = projectId.value
   const epoch = viewEpoch
-  const seq = ++jobSequence
-  if (!id) return
+  if (!id || disposed || starting.value) return
+  if (pendingJobRead?.projectId === id && pendingJobRead.epoch === epoch && pendingJobRead.sequence === jobSequence) return
+  const sequence = ++jobSequence
+  const owner = { projectId: id, epoch, sequence, readSequence: ++jobReadSequence }
+  pendingJobRead = owner
+  stopPolling()
   try {
-    const value = await vettingApi.latestRun(id)
-    if (seq !== jobSequence) return
-    if (value) await acceptJob(value, id, epoch)
+    const value = await vettingApi.latestRunProgress(id)
+    if (!ownsJob(id, epoch, sequence) || owner.readSequence !== jobReadSequence) return
+    if (value) {
+      await acceptProgress(value, id, epoch, sequence, owner.readSequence)
+      if (!ownsJob(id, epoch, sequence, value.id) || owner.readSequence !== jobReadSequence) return
+    }
   } catch {
-    if (epoch === viewEpoch && id === projectId.value) pollingPaused.value = true
+    if (ownsJob(id, epoch, sequence) && owner.readSequence === jobReadSequence) pollingPaused.value = true
+  } finally {
+    if (pendingJobRead === owner) pendingJobRead = null
   }
 }
 
 function retryPolling() {
+  if (pendingJobRead?.projectId === projectId.value && pendingJobRead.epoch === viewEpoch && pendingJobRead.sequence === jobSequence) return
   pollingPaused.value = false
-  if (job.value && isActiveJob(job.value)) void pollRun(projectId.value, job.value.id, viewEpoch)
+  if (job.value) void pollRun(projectId.value, job.value.id, viewEpoch)
   else void restoreJob()
 }
 
@@ -289,10 +404,20 @@ watch(projectId, () => {
   starting.value = false
   uploading.value = false
   uploadRole.value = 'auto'
+  uploadDocumentScope.value = 'auto'
+  checklist.value = null
+  checklistBaseline.value = []
+  checklistSequence++
+  checklistSaving.value = null
+  checklistLoading.value = false
+  checklistChanged.value = false
+  retainedChecklists.value = []
   statusSaving.value = false
   reviewSaving.value = false
   reviewFailed.value = false
   reviewCode.value = null
+  reviewVersion.value = null
+  reviewChanged.value = false
   reviewDrafts.value.clear()
   reviewDraft.value = emptyReview()
   reviewBaseline.value = emptyReview()
@@ -384,30 +509,50 @@ function closeDrawer() {
 }
 
 async function updateStatus(status: string) {
-  if (!selectedFinding.value || statusSaving.value || reviewSaving.value || running.value) return
+  if (!selectedFinding.value || statusSaving.value || reviewSaving.value || running.value || reviewChanged.value) return
   const id = projectId.value
-  const code = selectedFinding.value.code
+  const shown = selectedFinding.value, code = shown.code, version = findingVersion(shown), binding = findingBinding(shown)
+  if (!binding) { reviewChanged.value = true; return }
   const epoch = viewEpoch
   statusSaving.value = true
   try {
-    const updated = await vettingApi.updateStatus(id, code, status)
-    if (epoch !== viewEpoch || id !== projectId.value) return
-    const index = findings.value.findIndex((item) => item.code === updated.code)
+    const updated = await vettingApi.updateStatus(id, code, status, binding)
+    if (disposed || epoch !== viewEpoch || id !== projectId.value) return
+    const index = findings.value.findIndex((item) => findingVersion(item) === version)
+    if (index < 0 || findingVersion(updated) !== version) { retainChangedReview(version); return }
     if (index >= 0) findings.value.splice(index, 1, updated)
-    if (selectedCode.value === code) {
+    if (selectedDetail.value && findingVersion(selectedDetail.value) === version && !reviewChanged.value) {
       selectedDetail.value = updated
       if (!reviewDirty.value) loadReviewDraft(updated)
     }
     store.notify(`${updated.code} · ${statusLabel(updated.status)}`)
+  } catch (error) {
+    if (epoch === viewEpoch && id === projectId.value && error instanceof ApiError && error.code === 4104) retainChangedReview(version)
   } finally {
     if (epoch === viewEpoch) statusSaving.value = false
   }
 }
 
+function findingVersion(finding: Finding) {
+  return JSON.stringify([finding.code, finding.runId, finding.generatedRevisionSha256, finding.sourceSnapshotSha256])
+}
+
+function findingBinding(finding: Finding): FindingWriteBinding | null {
+  return finding.runId && finding.generatedRevisionSha256 && finding.sourceSnapshotSha256 ? {
+    expectedRunId: finding.runId, expectedGeneratedRevisionSha256: finding.generatedRevisionSha256,
+    expectedSourceSnapshotSha256: finding.sourceSnapshotSha256
+  } : null
+}
+
+function retainChangedReview(version: string) {
+  if (reviewVersion.value === version) { rememberReviewDraft(); reviewChanged.value = true }
+  store.notify(pick(versionCopy.changed), 6000)
+}
+
 function rememberReviewDraft() {
-  if (!reviewCode.value) return
-  if (reviewDirty.value) reviewDrafts.value.set(reviewCode.value, { ...reviewDraft.value })
-  else reviewDrafts.value.delete(reviewCode.value)
+  if (!reviewCode.value || !reviewVersion.value) return
+  if (reviewDirty.value) reviewDrafts.value.set(reviewVersion.value, { code: reviewCode.value, draft: { ...reviewDraft.value } })
+  else reviewDrafts.value.delete(reviewVersion.value)
 }
 
 function loadReviewDraft(finding: Finding) {
@@ -416,58 +561,89 @@ function loadReviewDraft(finding: Finding) {
     addendum: finding.addendumRequired === true ? 'required' : finding.addendumRequired === false ? 'notRequired' : 'undecided'
   }
   reviewCode.value = finding.code
+  reviewVersion.value = findingVersion(finding)
   reviewBaseline.value = { ...saved }
-  reviewDraft.value = { ...(reviewDrafts.value.get(finding.code) ?? saved) }
+  reviewDraft.value = { ...(reviewDrafts.value.get(reviewVersion.value)?.draft ?? saved) }
   reviewFailed.value = false
+  reviewChanged.value = !findingBinding(finding)
 }
 
 function discardReview() {
   if (!selectedFinding.value || reviewSaving.value) return
-  reviewDrafts.value.delete(selectedFinding.value.code)
+  reviewDrafts.value.delete(findingVersion(selectedFinding.value))
   loadReviewDraft(selectedFinding.value)
 }
 
+function discardRetainedReviews() {
+  for (const saved of retainedReviews.value) reviewDrafts.value.delete(saved.key)
+}
+
+async function refreshFinding() {
+  if (reviewSaving.value || statusSaving.value) return
+  rememberReviewDraft()
+  const id = projectId.value, code = selectedCode.value, epoch = viewEpoch
+  await reload()
+  if (disposed || epoch !== viewEpoch || id !== projectId.value || code !== selectedCode.value) return
+  const current = findings.value.find(item => item.code === code)
+  if (current) openFinding(current)
+}
+
 async function saveReview() {
-  if (!selectedFinding.value || reviewSaving.value || statusSaving.value || running.value || !reviewDirty.value) return
+  if (!selectedFinding.value || reviewSaving.value || statusSaving.value || running.value || !reviewDirty.value || reviewChanged.value) return
   const id = projectId.value, code = selectedFinding.value.code, epoch = viewEpoch
+  const version = findingVersion(selectedFinding.value), binding = findingBinding(selectedFinding.value)
+  if (!binding) { reviewChanged.value = true; return }
   const draft = { ...reviewDraft.value }
+  rememberReviewDraft()
   reviewSaving.value = true
   reviewFailed.value = false
   try {
     const updated = await vettingApi.updateReview(id, code, {
+      ...binding,
       reviewRemarks: draft.reviewRemarks, actionTaken: draft.actionTaken,
       addendumRequired: draft.addendum === 'undecided' ? null : draft.addendum === 'required'
     })
     if (disposed || epoch !== viewEpoch || id !== projectId.value) return
-    reviewDrafts.value.delete(code)
-    const index = findings.value.findIndex(item => item.code === code)
+    const index = findings.value.findIndex(item => findingVersion(item) === version)
+    if (index < 0 || findingVersion(updated) !== version) { retainChangedReview(version); return }
+    reviewDrafts.value.delete(version)
     if (index >= 0) findings.value.splice(index, 1, updated)
-    if (selectedCode.value === code) { selectedDetail.value = updated; loadReviewDraft(updated) }
+    if (selectedDetail.value && findingVersion(selectedDetail.value) === version && !reviewChanged.value) { selectedDetail.value = updated; loadReviewDraft(updated) }
     store.notify(t('vetting.review.saved'))
-  } catch {
-    if (epoch === viewEpoch && id === projectId.value) reviewFailed.value = true
+  } catch (error) {
+    if (epoch === viewEpoch && id === projectId.value) {
+      if (error instanceof ApiError && error.code === 4104) retainChangedReview(version)
+      else if (reviewVersion.value === version) reviewFailed.value = true
+    }
   } finally {
     if (epoch === viewEpoch) reviewSaving.value = false
   }
 }
 
 async function runVetting() {
-  if (running.value || uploading.value || reviewSaving.value || statusSaving.value || hasUnsavedReview.value || !projectId.value) return
+  if (running.value || uploading.value || reviewSaving.value || statusSaving.value || hasUnsavedReview.value || checklistDirty.value || checklistSaving.value !== null || !projectId.value) return
   const llmSelection = store.captureLlmSelection()
   const id = projectId.value
   const epoch = viewEpoch
-  jobSequence++
+  const sequence = ++jobSequence
+  stopPolling()
   starting.value = true
   try {
     const value = await vettingApi.startRun(id, store.locale, llmSelection)
-    await acceptJob(value, id, epoch, true)
+    if (!ownsJob(id, epoch, sequence)) return
+    await acceptJob(value, id, epoch, sequence, true)
+    if (!ownsJob(id, epoch, sequence, value.id)) return
   } finally {
-    if (epoch === viewEpoch) starting.value = false
+    if (ownsJob(id, epoch, sequence)) starting.value = false
   }
 }
 
 async function uploadPackage(event: Event) {
   const selected = Array.from((event.target as HTMLInputElement).files ?? [])
+  if (hasUnsavedReview.value || reviewSaving.value || checklistDirty.value || checklistSaving.value !== null) {
+    (event.target as HTMLInputElement).value = ''
+    return
+  }
   if (!selected.length || running.value || uploading.value) return
   const id = projectId.value
   const epoch = viewEpoch
@@ -476,7 +652,7 @@ async function uploadPackage(event: Event) {
   uploading.value = true
   store.setBusy(t('common.loading'))
   try {
-    const result = await vettingApi.uploadPackage(id, selected, sourceRole)
+    const result = await vettingApi.uploadPackage(id, selected, sourceRole, uploadDocumentScope.value)
     if (epoch !== viewEpoch || id !== projectId.value) return
     store.notify(result.messages.join('\n') || t('common.done'), 5000)
     await reload()
@@ -503,6 +679,76 @@ async function exportReport() {
     }
   } finally {
     exporting.value = false
+  }
+}
+
+watch(() => job.value?.id, () => {
+  checklistSequence++
+  if (currentChecklistDirty.value || checklistSaving.value) checklistChanged.value = true
+  else { checklist.value = null; checklistBaseline.value = []; checklistChanged.value = false }
+  checklistLoading.value = false
+  checklistSaving.value = null
+})
+
+async function openChecklist(event?: Event) {
+  if ((event && !(event.target as HTMLDetailsElement).open) || checklist.value || job.value?.status !== 'COMPLETED' || job.value?.sourceVerification === 'NOT_CHECKED') return
+  const id = projectId.value, runId = job.value.id, epoch = viewEpoch, sequence = ++checklistSequence
+  checklistLoading.value = true
+  try {
+    const value = await vettingApi.checklist(id, runId)
+    if (disposed || epoch !== viewEpoch || runId !== job.value?.id || sequence !== checklistSequence) return
+    checklist.value = value
+    checklistBaseline.value = structuredClone(value.items)
+    checklistChanged.value = !value.sourceSnapshotSha256 || value.runId !== runId
+  } finally {
+    if (epoch === viewEpoch && sequence === checklistSequence) checklistLoading.value = false
+  }
+}
+
+async function refreshChecklist() {
+  if (checklistSaving.value || checklistLoading.value) return
+  if (checklist.value && currentChecklistDirty.value) retainedChecklists.value.push(JSON.parse(JSON.stringify(checklist.value)))
+  checklist.value = null
+  checklistBaseline.value = []
+  await openChecklist()
+}
+
+function checkDirty(item: VettingChecklistItem) {
+  const saved = checklistBaseline.value.find(row => row.id === item.id)
+  return !saved || item.status !== saved.status || item.remarks !== saved.remarks
+}
+
+function restoreCheck(item: VettingChecklistItem) {
+  const saved = checklistBaseline.value.find(row => row.id === item.id)
+  if (saved) Object.assign(item, saved)
+}
+
+async function saveCheck(item: VettingChecklistItem) {
+  if (!checklist.value || !checklistWritable.value || checklistSaving.value || !checkDirty(item)) return
+  const id = projectId.value, loaded = checklist.value, epoch = viewEpoch, sequence = checklistSequence
+  const binding = { runId: loaded.runId, runSnapshotSha256: loaded.runSnapshotSha256, sourceSnapshotSha256: loaded.sourceSnapshotSha256 }
+  const submitted = { id: item.id, status: item.status, remarks: item.remarks }
+  checklistSaving.value = item.id
+  try {
+    const saved = await vettingApi.saveChecklist(id, binding, [submitted])
+    if (disposed || epoch !== viewEpoch || id !== projectId.value || sequence !== checklistSequence || checklist.value !== loaded
+      || binding.runId !== job.value?.id || saved.runId !== binding.runId || saved.runSnapshotSha256 !== binding.runSnapshotSha256
+      || saved.sourceSnapshotSha256 !== binding.sourceSnapshotSha256) return
+    const savedRow = saved.items.find(row => row.id === item.id)
+    if (savedRow) {
+      const original = checklistBaseline.value.find(row => row.id === item.id)
+      if (original) Object.assign(original, savedRow)
+      // A further edit while the request was in flight remains unsaved.
+      if (item.status === submitted.status && item.remarks === submitted.remarks) Object.assign(item, savedRow)
+    }
+    store.notify(t('vetting.checklist.saved'))
+  } catch (error) {
+    if (epoch === viewEpoch && id === projectId.value && checklist.value === loaded && error instanceof ApiError && error.code === 4104) {
+      checklistChanged.value = true
+      store.notify(pick(versionCopy.changed), 6000)
+    }
+  } finally {
+    if (epoch === viewEpoch && sequence === checklistSequence) checklistSaving.value = null
   }
 }
 
@@ -547,10 +793,16 @@ function tagClass(group: string) {
             <option value="package_manifest">{{ t('vetting.uploadRole.package_manifest') }}</option>
           </select>
         </label>
-        <button class="btn" type="button" :disabled="running || uploading" @click="packageInput?.click()">
+        <label class="upload-role">
+          <span>{{ t('vetting.documentScope.label') }}</span>
+          <select v-model="uploadDocumentScope" :disabled="running || uploading">
+            <option v-for="value in ['auto', 'package', 'works_pss', 'pricing', 'example', 'drawing']" :key="value" :value="value">{{ t(`vetting.documentScope.${value}`) }}</option>
+          </select>
+        </label>
+        <button class="btn" type="button" :disabled="running || uploading || hasUnsavedReview || reviewSaving || checklistDirty || checklistSaving !== null" @click="packageInput?.click()">
           <AppIcon name="upload" :size="15" />{{ t('vetting.actions.upload') }}
         </button>
-        <button class="btn primary" type="button" :disabled="running || uploading || reviewSaving || statusSaving || hasUnsavedReview || !files.some(file => file.parsed)" @click="runVetting">
+        <button class="btn primary" type="button" :disabled="running || uploading || reviewSaving || statusSaving || hasUnsavedReview || checklistDirty || checklistSaving !== null || !files.some(file => file.parsed)" @click="runVetting">
           <AppIcon name="play" :size="15" />
           {{ running ? t('vetting.actions.running') : t('vetting.actions.run') }}
         </button>
@@ -566,13 +818,54 @@ function tagClass(group: string) {
     </div>
 
     <p v-if="hasUnsavedReview" class="warning-note" role="status">{{ t('vetting.review.unsavedExport') }} {{ unsavedReviewCodes.join(' · ') }}</p>
+    <p v-if="checklistDirty" class="warning-note" role="status">{{ t('vetting.checklist.dirty') }}</p>
+    <p v-if="job?.sourceSetStale" class="warning-note" role="status">{{ t('vetting.sourceSetStale') }}</p>
+    <details v-if="retainedReviews.length" class="surface section-gap">
+      <summary>{{ pick(versionCopy.retained) }}</summary>
+      <div v-for="saved in retainedReviews" :key="saved.key">
+        <strong>{{ saved.code }}</strong><pre>{{ saved.draft.reviewRemarks }}{{ '\n' }}{{ saved.draft.actionTaken }}{{ '\n' }}{{ saved.draft.addendum }}</pre>
+      </div>
+      <button class="btn" type="button" @click="discardRetainedReviews">{{ pick(versionCopy.discard) }}</button>
+    </details>
+    <details v-if="retainedChecklists.length" class="surface section-gap">
+      <summary>{{ pick(versionCopy.retained) }}</summary>
+      <div v-for="saved in retainedChecklists" :key="saved.runId + saved.runSnapshotSha256">
+        <strong>{{ saved.runId }}</strong><pre v-for="item in saved.items" :key="item.id">{{ item.clause }} · {{ item.status }}{{ '\n' }}{{ item.remarks }}</pre>
+      </div>
+      <button class="btn" type="button" @click="retainedChecklists = []">{{ pick(versionCopy.discard) }}</button>
+    </details>
+
+    <details v-if="job?.status === 'COMPLETED' && !jobDetailsPending" class="surface checklist-panel section-gap" @toggle="openChecklist">
+      <summary>{{ t('vetting.checklist.title') }}</summary>
+      <p class="muted small">{{ t('vetting.checklist.note') }}</p>
+      <p v-if="checklistChanged" class="warning-note" role="alert">{{ pick(versionCopy.changed) }}
+        <button class="btn" type="button" :disabled="!!checklistSaving || checklistLoading" @click="refreshChecklist">{{ pick(versionCopy.refresh) }}</button>
+      </p>
+      <p v-if="checklistLoading">{{ t('common.loading') }}</p>
+      <div v-if="checklist" class="table-wrap checklist-table">
+        <table>
+          <thead><tr><th>PSS Clause</th><th>Description</th><th>{{ t('common.status') }}</th><th>{{ t('vetting.checklist.remarks') }}</th></tr></thead>
+          <tbody><tr v-for="item in checklist.items" :key="item.id">
+            <td>{{ item.clause }}<div class="muted small">{{ item.section }}</div></td>
+            <td>{{ item.description }}<p v-if="item.scopeNote" class="warning-note small">{{ item.scopeNoteText ? pick(item.scopeNoteText) : item.scopeNote }}</p></td>
+            <td><select v-model="item.status" :disabled="!checklistWritable || checklistSaving === item.id">
+              <option v-for="status in ['unchecked', 'fulfilled', 'not_applicable']" :key="status" :value="status">{{ t(`vetting.checklist.${status}`) }}</option>
+            </select></td>
+            <td><textarea v-model="item.remarks" :aria-label="`${item.clause} ${t('vetting.checklist.remarks')}`" maxlength="4000" :disabled="!checklistWritable || checklistSaving === item.id" />
+              <div class="row"><button class="btn" type="button" :disabled="!checklistWritable || !!checklistSaving || !checkDirty(item)" @click="saveCheck(item)">{{ t('vetting.checklist.save') }}</button>
+              <button v-if="checkDirty(item)" class="btn ghost" type="button" :disabled="checklistSaving === item.id" @click="restoreCheck(item)">{{ t('vetting.checklist.reset') }}</button></div>
+            </td>
+          </tr></tbody>
+        </table>
+      </div>
+    </details>
 
     <div v-if="job || pollingPaused" class="surface section-gap vetting-run-panel" aria-live="polite">
       <div class="surface-body">
         <div class="row">
           <strong>{{ t('vetting.job.title') }}</strong>
           <span v-if="job" class="tag" :class="job.status === 'FAILED' ? 'danger' : 'info'">
-            {{ t(`vetting.job.status.${job.status}`) }}
+            {{ jobDetailsPending ? t('common.loading') : t(`vetting.job.status.${job.status}`) }}
           </span>
           <span v-if="job?.totalUnits" class="mono muted small">{{ t('vetting.job.progressLabel') }}: {{ job.completedUnits }} / {{ job.totalUnits }}</span>
           <span class="spacer" />
@@ -580,15 +873,20 @@ function tagClass(group: string) {
             <AppIcon name="refresh" :size="14" />{{ t('vetting.job.resume') }}
           </button>
         </div>
-        <p v-if="job?.status === 'COMPLETED'" class="warning-note">{{ t('vetting.job.executionCompleteNote') }}</p>
+        <p v-if="job?.status === 'COMPLETED' && !jobDetailsPending" class="warning-note">{{ t('vetting.job.executionCompleteNote') }}</p>
         <p v-if="job?.message" class="small">{{ job.message }}</p>
+        <p v-if="job?.recoveryStatus" class="small">{{ t(`vetting.recovery.${job.recoveryStatus}`) }}</p>
+        <p v-if="job?.reportSnapshotId" class="mono small">{{ t('vetting.report.snapshot') }}: {{ job.reportSnapshotId }}</p>
+        <details v-if="job?.reliablePackets?.length"><summary>{{ t('vetting.recovery.reliablePackets') }} · {{ job.reliablePackets.length }}</summary>
+          <div v-for="saved in job.reliablePackets" :key="saved.packet.packetId" class="small section-gap"><strong>{{ checkStateLabel(saved.packet.checkState) }}</strong> · {{ saved.packet.status }}<p class="mono" style="overflow-wrap:anywhere">{{ saved.packet.packetId }} · {{ saved.packet.sourceSnapshotSha256 }}</p><p v-for="warning in saved.warnings" :key="warning" class="warning-note">{{ warning }}</p><details><summary>{{ t('vetting.drawer.evidence') }}</summary><pre>{{ JSON.stringify(saved, null, 2) }}</pre></details></div>
+        </details>
         <p v-if="job" class="muted small">{{ recordedJobModel ? `${t('llm.recordedModel')}: ${recordedJobModel}` : t('llm.identityUnknown') }}<template v-if="jobModelIdentity"> · {{ jobModelIdentity.profileId }} · {{ jobModelIdentity.provider }}</template></p>
         <p v-if="jobModelIdentity" class="muted small">{{ t('llm.identityNote') }}</p>
         <progress v-if="running && jobPercent !== null" class="vetting-progress" :value="jobPercent" max="100" :aria-label="t('vetting.job.title')" />
         <p v-if="job?.status === 'FAILED' && job.error" class="run-error">{{ job.error }}</p>
         <p v-if="pollingPaused" class="warning-note">{{ t('vetting.job.connectionPaused') }}</p>
         <p v-else-if="running" class="muted small">{{ t('vetting.job.background') }}</p>
-        <p v-if="job?.status === 'COMPLETED'" class="muted small">{{ t('vetting.review.retained') }}</p>
+        <p v-if="job?.status === 'COMPLETED' && !jobDetailsPending" class="muted small">{{ t('vetting.review.retained') }}</p>
       </div>
     </div>
 
@@ -636,6 +934,7 @@ function tagClass(group: string) {
               <tr v-for="(topic, topicRow) in coverage.semanticTopics" :key="`${topic.reviewKind ?? 'topic'}:${topic.topicIndex}:${topicRow}`">
                 <td><strong>#{{ topic.topicIndex }}</strong><span v-if="topic.reviewKind === 'project_reference'" class="tag neutral">{{ t('vetting.coverage.projectReference') }}</span><div class="small muted">{{ topic.topic }}</div><div v-if="topic.referenceIds?.length" class="small">{{ topic.referenceIds.join(' · ') }}</div></td>
                 <td>
+                  <strong>{{ checkStateLabel(topic.checkState) }}</strong>
                   <span class="tag" :class="['failed', 'partial', 'not_submitted'].includes(reviewScopeStatus(topic)) ? 'warn' : 'neutral'">{{ t(`vetting.coverage.aggregateStates.${reviewScopeStatus(topic)}`) }}</span>
                   <div class="small muted">{{ t('vetting.coverage.globalCall') }}: {{ callStatusLabel(topic.globalCallStatus ?? topic.status) }}</div>
                   <div v-if="topic.error" class="warning-note">{{ topic.error }}</div>
@@ -648,6 +947,7 @@ function tagClass(group: string) {
                     <summary class="small">{{ t('vetting.coverage.packetDetails') }}</summary>
                     <div v-for="packet in topic.packetAudits" :key="packet.packetId" class="small section-gap">
                       <strong>#{{ packet.packetIndex }}</strong> {{ callStatusLabel(packet.status) }}
+                      <div>{{ checkStateLabel(packet.checkState) }}</div>
                       <div class="muted">{{ t(`vetting.coverage.budgetStates.${packetBudgetStatus(packet.inputBudgetStatus)}`) }}</div>
                       <div>{{ t('vetting.coverage.actualSubmission') }}: {{ packet.actualGatewayCallStarted === true ? t('vetting.coverage.submitted') : packet.actualGatewayCallStarted === false ? t('vetting.coverage.notSubmitted') : t('vetting.coverage.unknownCount') }}</div>
                       <div v-if="packet.inputBudgetMetadata?.observation">{{ t('vetting.coverage.tokenCounts') }}: {{ packet.inputBudgetMetadata.observation.inputTokens ?? t('vetting.coverage.unknownCount') }} + {{ packet.inputBudgetMetadata.observation.outputReserveTokens ?? t('vetting.coverage.unknownCount') }} / {{ packet.inputBudgetMetadata.observation.effectiveContextTokens ?? t('vetting.coverage.unknownCount') }}</div>
@@ -724,7 +1024,7 @@ function tagClass(group: string) {
           </select>
           <span class="spacer" />
           <span class="muted small">{{ findings.length }} / {{ metrics?.total ?? 0 }}</span>
-          <button class="btn" type="button" :disabled="loading" @click="reload">
+          <button class="btn" type="button" :disabled="loading" @click="reload()">
             <AppIcon name="refresh" :size="15" />{{ t('common.refresh') }}
           </button>
         </div>
@@ -930,6 +1230,8 @@ function tagClass(group: string) {
                   <span class="tag" :class="item.located ? 'ok' : 'warn'">{{ item.located ? t('vetting.drawer.located') : t('vetting.drawer.unverified') }}</span>
                 </div>
                 <div class="quote">{{ item.quote }}</div>
+                <FixedBaselineEvidencePanel v-if="item.fixedBaselineEvidence" :pointer="item.fixedBaselineEvidence" :locale="store.locale" />
+                <CanonicalEvidencePanel v-else-if="item.canonicalEvidence" :pointer="item.canonicalEvidence" :locale="store.locale" />
                 <div v-if="item.packetId || item.packetSourceSnapshotSha256" class="small">
                   <div class="mono" style="overflow-wrap:anywhere">{{ t('vetting.coverage.fullInputPacket') }}: {{ item.packetId ?? t('vetting.coverage.unknownCount') }}</div>
                   <div class="mono" style="overflow-wrap:anywhere">{{ t('vetting.coverage.packetSnapshot') }}: {{ item.packetSourceSnapshotSha256 ?? t('vetting.coverage.unknownCount') }}</div>
@@ -943,6 +1245,13 @@ function tagClass(group: string) {
               <AppIcon name="alert" :size="14" />
               <span>{{ t('vetting.drawer.notLocated') }}</span>
             </div>
+            <div class="row" style="margin-top: 12px">
+              <button class="btn" type="button" :disabled="handoffDisabled" @click="consultFinding">
+                <AppIcon name="advice" :size="15" />{{ pick(reviewHandoffCopy.consult) }}
+              </button>
+            </div>
+            <p class="muted small">{{ pick(reviewHandoffCopy.entryNote) }}</p>
+            <p v-if="hasUnsavedReview || checklistDirty" class="warning-note" role="status">{{ pick(reviewHandoffCopy.saveFirst) }}</p>
           </div>
 
           <div class="detail-actions">
@@ -966,8 +1275,11 @@ function tagClass(group: string) {
               </label>
               <p v-if="selectedFinding.reviewUpdatedAt" class="small muted">{{ t('vetting.review.savedAt') }} {{ new Date(selectedFinding.reviewUpdatedAt).toLocaleString() }}</p>
               <p v-if="reviewFailed" class="warning-note" role="alert">{{ t('vetting.review.saveFailed') }}</p>
+              <p v-if="reviewChanged" class="warning-note" role="alert">{{ pick(versionCopy.changed) }}
+                <button class="btn" type="button" :disabled="reviewSaving || statusSaving" @click="refreshFinding">{{ pick(versionCopy.refresh) }}</button>
+              </p>
               <div class="row">
-                <button class="btn primary" type="button" :disabled="reviewSaving || statusSaving || running || !reviewDirty" @click="saveReview">{{ t('vetting.review.save') }}</button>
+                <button class="btn primary" type="button" :disabled="reviewSaving || statusSaving || running || reviewChanged || !reviewDirty" @click="saveReview">{{ t('vetting.review.save') }}</button>
                 <button class="btn" type="button" :disabled="reviewSaving || !reviewDirty" @click="discardReview">{{ t('vetting.review.discard') }}</button>
                 <span v-if="reviewDirty" class="small muted">{{ t('vetting.review.unsaved') }}</span>
               </div>
@@ -975,7 +1287,7 @@ function tagClass(group: string) {
             <button
               class="btn success"
               type="button"
-              :disabled="statusSaving || reviewSaving || running || selectedFinding.status.toUpperCase() === 'HANDLED'"
+              :disabled="statusSaving || reviewSaving || running || reviewChanged || selectedFinding.status.toUpperCase() === 'HANDLED'"
               @click="updateStatus('Handled')"
             >
               <AppIcon name="check" :size="15" />{{ t('vetting.drawer.markHandled') }}
@@ -983,12 +1295,12 @@ function tagClass(group: string) {
             <button
               class="btn"
               type="button"
-              :disabled="statusSaving || reviewSaving || running || selectedFinding.status.toUpperCase() === 'ASSIGNED'"
+              :disabled="statusSaving || reviewSaving || running || reviewChanged || selectedFinding.status.toUpperCase() === 'ASSIGNED'"
               @click="updateStatus('Assigned')"
             >
               <AppIcon name="external" :size="15" />{{ t('vetting.drawer.assign') }}
             </button>
-            <button class="btn" type="button" :disabled="statusSaving || reviewSaving || running || selectedFinding.status.toUpperCase() === 'OPEN'" @click="updateStatus('Open')">
+            <button class="btn" type="button" :disabled="statusSaving || reviewSaving || running || reviewChanged || selectedFinding.status.toUpperCase() === 'OPEN'" @click="updateStatus('Open')">
               {{ t('vetting.review.reopen') }}
             </button>
           </div>
@@ -1018,6 +1330,8 @@ function tagClass(group: string) {
               <td>{{ pick(file.role) }}</td>
               <td>
                 <span class="tag" :class="file.parsed ? 'ok' : 'warn'">{{ file.status }}</span>
+                <p v-if="file.documentScope === 'drawing'" class="small">{{ t('vetting.documentScope.drawing') }}</p>
+                <p v-if="file.exclusionReason" class="small">{{ t(`advice.sourceScope.reasons.${file.exclusionReason}`) }}</p>
               </td>
               <td>{{ file.pageCount || '—' }}</td>
               <td><div class="small">{{ file.parseMessage }}</div><div v-for="(warning, index) in file.warnings" :key="index" class="warning-note">{{ warning }}</div><span v-if="!file.parseMessage && !file.warnings?.length">—</span></td>
@@ -1042,6 +1356,12 @@ function tagClass(group: string) {
 .report-format { width: auto; min-width: 112px; }
 .upload-role { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
 .upload-role select { width: auto; min-width: 150px; }
+.checklist-panel { padding: 16px; }
+.checklist-panel summary { cursor: pointer; font-weight: 700; }
+.checklist-table { max-height: 520px; overflow: auto; }
+.checklist-table th { position: sticky; top: 0; background: var(--surface, #fff); z-index: 1; }
+.checklist-table td:nth-child(2) { min-width: 280px; }
+.checklist-table textarea { min-width: 260px; min-height: 70px; }
 .vetting-run-panel p { margin: 10px 0 0; }
 .vetting-progress { width: 100%; height: 9px; margin-top: 10px; accent-color: var(--accent); }
 .coverage-panel summary { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 14px 18px; cursor: pointer; }
